@@ -33,7 +33,9 @@ import json
 #from sentence_transformers import SentenceTransformer
 from langchain_ollama import OllamaEmbeddings
 
+# Use consistent embedding model across the class
 model_name = "sentence-transformers/all-MiniLM-L6-v2"
+# Global embeddings instance - will be replaced by instance-specific one
 embeddings = HuggingFaceEmbeddings(model_name=model_name)
 
 
@@ -64,7 +66,8 @@ class PostgresVectorStore(VectorStore):
     
 
         self.collection_name = collection_name
-        self._embedding_function = OllamaEmbeddings(model="llama3.3")
+        # Use consistent embedding model - same as the one used for storing embeddings
+        self._embedding_function = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
         self.override_relevance_score_fn = relevance_score_fn
         
         # Load Postgres DB credentials from config_pg.yaml
@@ -83,6 +86,15 @@ class PostgresVectorStore(VectorStore):
         try:
             #prepare connection string
             self.connectionstring = conn_string = f"postgresql+psycopg://{username}:{password}@{host}:{port}/{database}"  # Uses psycopg3!
+
+            # Create engine with connection pooling for better performance
+            self.engine = create_engine(
+                self.connectionstring,
+                pool_size=5,
+                max_overflow=10,
+                pool_pre_ping=True,
+                pool_recycle=3600
+            )
 
             vector_store = PGVector(
                         embeddings=self._embedding_function,
@@ -183,20 +195,28 @@ class PostgresVectorStore(VectorStore):
 
     def query_pdf_collection(self, query: str, n_results: int = 3) -> List[Dict[str, Any]]:
         """Query the PDF documents collection"""
+        start_time = time.time()
         print("🔍 [Postgres] Querying PDF Collection")
+        logging.info(f"Starting PDF collection query for: '{query[:50]}...' with n_results={n_results}")
         
         try:
             # Use your custom implementation directly instead of vectorstore's implementation
             formatted_results = self.similarity_search(query, k=n_results)
             
+            duration = time.time() - start_time
+            
             if not formatted_results:
+                logging.warning(f"No results found for query in {duration:.2f}s")
                 print("No results found for the query.")
                 return []
                 
-            print(f"🔍 [Postgres] Retrieved {len(formatted_results)} chunks from PDF Collection")
+            logging.info(f"🔍 [Postgres] Retrieved {len(formatted_results)} chunks from PDF Collection in {duration:.2f}s")
+            print(f"🔍 [Postgres] Retrieved {len(formatted_results)} chunks from PDF Collection in {duration:.2f}s")
             return formatted_results
             
         except Exception as e:
+            duration = time.time() - start_time
+            logging.error(f"Error in query_pdf_collection after {duration:.2f}s: {str(e)}")
             print(f"Error in query_pdf_collection: {str(e)}")
             import traceback
             traceback.print_exc()
@@ -232,13 +252,30 @@ class PostgresVectorStore(VectorStore):
         """Return docs most similar to query."""
         logging.info(f"Similarity Search for Postgres Vector Store")
 
+        try:
+            # First try using the built-in PGVector search which is more efficient
+            documents = self.vectorstore.similarity_search(query, k=k)
+            
+            if documents:
+                logging.info(f"🔍 [PostgresDB] Retrieved {len(documents)} chunks using PGVector search")
+                return self._convert_documents_to_dict(documents)
+            
+            # Fallback to custom search if needed
+            logging.info("No results from PGVector search, trying custom search...")
+            return self._custom_similarity_search(query, k)
+            
+        except Exception as e:
+            logging.error(f"Error in similarity_search: {str(e)}")
+            # Fallback to custom search
+            return self._custom_similarity_search(query, k)
+    
+    def _custom_similarity_search(self, query: str, k: int = 3) -> List[Dict[str, Any]]:
+        """Custom similarity search implementation as fallback"""
+        logging.info(f"Using custom similarity search for Postgres Vector Store")
+
         # Get the embedding for the query using the same model that created the embeddings
-        query_embedding = embeddings.embed_query(query)
+        query_embedding = self._embedding_function.embed_query(query)
         
-        # Create engine connection
-        engine = create_engine(self.connectionstring)
-        #print(f'Connection string: {self.connectionstring}')
-         
         # Format the embedding vector as a PostgreSQL vector literal
         embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
         embedding_dim = len(query_embedding)  # Get actual dimension
@@ -246,43 +283,47 @@ class PostgresVectorStore(VectorStore):
         formatted_results = []
 
         try:
-            with engine.begin() as conn:
+            with self.engine.begin() as conn:
                 
                 print(f"Using embedding vector: {embedding_str[:50]}...")
-                search_query = f"""SELECT a.source, a.content, b.doc_id, b.chunk_metadata, b.vector <=> '{embedding_str}'::vector({embedding_dim}) AS distance
-                                FROM documents a JOIN embeddings b ON a.id = b.doc_id
-                                ORDER BY distance
-                                LIMIT {k}; """
+                
+                # First, try to determine the correct table structure
+                # Check what tables exist for this collection
+                collection_table = f"langchain_pg_embedding_{self.collection_name.lower().replace(' ', '_')}"
+                
+                # Try the standard PGVector table structure first
+                search_query = f"""
+                    SELECT document, cmetadata, embedding <=> %s::vector({embedding_dim}) AS distance
+                    FROM {collection_table}
+                    ORDER BY distance
+                    LIMIT %s
+                """
 
-                print(f"Executing search query...")
-                result = conn.execute(text(search_query), { "k": k})
+                print(f"Executing search query on table: {collection_table}")
+                result = conn.execute(text(search_query), (embedding_str, k))
                 rows = result.fetchall()
         
                 # Format results
                 formatted_results = []
                 for row in rows:
-                    source = row[0]
-                    content = row[1]
-                    doc_id = row[2]
-                    chunk_metadata = row[3]
-                    distance = row[4]
+                    content = row[0]
+                    metadata = row[1] if row[1] else {}
+                    distance = row[2]
                     
                     # Process metadata - either parse JSON or use as is
-                    if isinstance(chunk_metadata, str):
+                    if isinstance(metadata, str):
                         try:
-                            base_metadata = json.loads(chunk_metadata)
+                            base_metadata = json.loads(metadata)
                         except json.JSONDecodeError:
-                            base_metadata = {"raw_metadata": chunk_metadata}
-                    elif chunk_metadata is None:
+                            base_metadata = {"raw_metadata": metadata}
+                    elif metadata is None:
                         base_metadata = {}
                     else:
-                        base_metadata = chunk_metadata
+                        base_metadata = metadata
                     
-                    # Add source and doc_id to metadata
+                    # Add similarity score to metadata
                     enhanced_metadata = {
                         **base_metadata,
-                        "source": source,
-                        "page_numbers": doc_id,
                         "similarity_score": float(distance)
                     }
                     
@@ -292,19 +333,17 @@ class PostgresVectorStore(VectorStore):
                         "metadata": enhanced_metadata
                     }
 
-                    print(f"Document from: {source}, Page Numbers: {doc_id}, Score: {distance}")
+                    print(f"Document Score: {distance}")
                     formatted_results.append(result_item)
                 
                 print(f"🔍 [PostgresDB] Retrieved {len(formatted_results)} chunks from PDF Collection")
                 return formatted_results    
     
         except Exception as e:
-            print(f"Error performing similarity search: {str(e)}")
+            print(f"Error performing custom similarity search: {str(e)}")
             import traceback
             traceback.print_exc()
             return []
-        finally:
-            engine.dispose()
         
     
      
@@ -343,6 +382,44 @@ class PostgresVectorStore(VectorStore):
         logging.info(f"from_texts")
         """Return VectorStore initialized from texts and embeddings."""
         raise NotImplementedError("from_texts method must be implemented...")
+
+    def optimize_database(self):
+        """Create indexes for better similarity search performance"""
+        try:
+            with self.engine.begin() as conn:
+                collection_table = f"langchain_pg_embedding_{self.collection_name.lower().replace(' ', '_')}"
+                
+                # Create vector index using HNSW for fast similarity search
+                index_query = f"""
+                    CREATE INDEX IF NOT EXISTS {collection_table}_embedding_hnsw_idx 
+                    ON {collection_table} 
+                    USING hnsw (embedding vector_cosine_ops);
+                """
+                
+                conn.execute(text(index_query))
+                logging.info(f"Created HNSW index on {collection_table} for faster similarity search")
+                
+                # Create index on metadata for filtering
+                metadata_index_query = f"""
+                    CREATE INDEX IF NOT EXISTS {collection_table}_metadata_idx 
+                    ON {collection_table} 
+                    USING gin (cmetadata);
+                """
+                
+                conn.execute(text(metadata_index_query))
+                logging.info(f"Created GIN index on metadata for {collection_table}")
+                
+        except Exception as e:
+            logging.warning(f"Could not create indexes: {str(e)}")
+
+    def __del__(self):
+        """Cleanup database connections when the object is destroyed"""
+        try:
+            if hasattr(self, 'engine'):
+                self.engine.dispose()
+                logging.info("Database connections disposed")
+        except Exception as e:
+            logging.warning(f"Error disposing database connections: {str(e)}")
 
 def main():
     parser = argparse.ArgumentParser(description="Manage Oracle DB vector store")

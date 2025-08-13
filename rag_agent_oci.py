@@ -11,6 +11,7 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import yaml
+import re
 
 # OCI imports
 import oci
@@ -691,8 +692,8 @@ def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
             # Extract only what follows "The final answer is:"
             response["answer"] = re.sub(r'.*The final answer is:\s*', '', response["answer"])
             # Remove any remaining LaTeX formatting
-            response["answer"] = agent._remove_latex_formatting(response["answer"])
-        
+            response["answer"] = rag_agent._remove_latex_formatting(response["answer"])
+
         print("\nResponse:")
         print("-" * 50)
         print(response["answer"])
