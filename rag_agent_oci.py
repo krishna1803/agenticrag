@@ -458,7 +458,7 @@ class OCIRAGAgent:
             - Have I used Australian English and the required citation format?
             """
 
-        prompt = PromptTemplate.from_template(prompt_template)
+        prompt = PromptTemplate.from_template(prompt_template,query=query, formatted_context=formatted_context)
         
         logger.info("Generating response using OCI Generative AI")
         logger.info(f"Query: {query}")
