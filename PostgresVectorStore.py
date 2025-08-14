@@ -293,14 +293,14 @@ class PostgresVectorStore(VectorStore):
                 
                 # Try the standard PGVector table structure first
                 search_query = f"""
-                    SELECT document, cmetadata, embedding <=> %s::vector({embedding_dim}) AS distance
+                    SELECT document, cmetadata, embedding <=> :embedding_vector::vector({embedding_dim}) AS distance
                     FROM {collection_table}
                     ORDER BY distance
-                    LIMIT %s
+                    LIMIT :limit_count
                 """
 
                 print(f"Executing search query on table: {collection_table}")
-                result = conn.execute(text(search_query), (embedding_str, k))
+                result = conn.execute(text(search_query), {"embedding_vector": embedding_str, "limit_count": k})
                 rows = result.fetchall()
         
                 # Format results
