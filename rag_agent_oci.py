@@ -473,7 +473,7 @@ class OCIRAGAgent:
                 | self.genai_client
             )
             currtime = time.time()
-            response = chain.invoke({"query": query,formatted_context: formatted_context})
+            response = chain.invoke({"query": query,"formatted_context": formatted_context})
             logger.info(f"Response from LLM generated in {time.time() - currtime:.2f} seconds")
             # For streaming, we need to collect the tokens
             answer = ""
@@ -490,7 +490,7 @@ class OCIRAGAgent:
                 | StrOutputParser()
             )
             currtime = time.time()
-            answer = chain.invoke({"query": query,formatted_context: formatted_context})
+            answer = chain.invoke({"query": query, "formatted_context": formatted_context})
             logger.info(f"Response from LLM generated in {time.time() - currtime:.2f} seconds")
 
         # Add sources to response if available
