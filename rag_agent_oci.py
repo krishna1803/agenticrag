@@ -112,6 +112,7 @@ class OCIRAGAgent:
     def _process_query_with_cot(self, query: str) -> Dict[str, Any]:
         """Process query using Chain of Thought reasoning with multiple agents"""
         logger.info("Processing query with Chain of Thought reasoning")
+        cot_start_time = time.time()
         
         # Get initial context based on selected collection
         initial_context = []
@@ -171,48 +172,28 @@ class OCIRAGAgent:
                 logger.info("Falling back to general response")
                 return self._generate_general_response(query)
             
-            # Step 2: Research each step (try parallel first, fall back to sequential)
+            # Step 2: Research each step (parallel execution)
             logger.info("Step 2: Research (parallel execution)")
+            research_start_time = time.time()
+            
             plan_steps = [step for step in plan.split("\n") if step.strip()]
             if len(plan_steps) > 3:
                 logger.info(f"Limiting plan from {len(plan_steps)} steps to 3 steps")
                 plan_steps = plan_steps[:3]
 
-            # Try to use parallel processing with proper safeguards
+            # Use improved parallel processing with ThreadPoolExecutor
             try:
-                logger.info("Attempting parallel research execution")
-                
-                # Check if we're already in an event loop
-                try:
-                    # Try to get the running loop but don't use run_coroutine_threadsafe
-                    existing_loop = asyncio.get_running_loop()
-                    logger.info("Existing event loop detected - switching to sequential processing for safety")
-                    
-                    # If we're in an event loop, use sequential processing instead
-                    # This avoids potential deadlocks with nested event loops
-                    research_results = self._research_steps_sequential(query, plan_steps)
-                    
-                except RuntimeError:
-                    # No event loop running, create a new one
-                    logger.info("Creating new event loop for parallel processing")
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        # Add a timeout to prevent indefinite hanging
-                        research_results = loop.run_until_complete(
-                            asyncio.wait_for(
-                                self._research_steps_parallel(query, plan_steps),
-                                timeout=120  # 2 minute timeout
-                            )
-                        )
-                    finally:
-                        loop.close()
-                        logger.info("Event loop closed")
+                logger.info("Attempting parallel research execution with ThreadPoolExecutor")
+                research_results = self._research_steps_parallel_fixed(query, plan_steps)
+                research_duration = time.time() - research_start_time
+                logger.info(f"Parallel research completed for {len(research_results)} steps in {research_duration:.2f} seconds")
             
             except Exception as e:
                 logger.error(f"Error in parallel research: {str(e)}")
                 logger.info("Falling back to sequential research")
                 research_results = self._research_steps_sequential(query, plan_steps)
+                research_duration = time.time() - research_start_time
+                logger.info(f"Sequential research completed in {research_duration:.2f} seconds")
             
             # Step 3: Batch reasoning for better efficiency
             logger.info("Step 3: Reasoning (batch processing)")
@@ -260,7 +241,10 @@ class OCIRAGAgent:
                 
                 # Remove LaTeX formatting from final answer
                 final_answer = self._remove_latex_formatting(final_answer)
-                logger.info(f"Final synthesized answer generated")
+                
+                total_duration = time.time() - cot_start_time
+                logger.info(f"Final synthesized answer generated - Total CoT time: {total_duration:.2f} seconds")
+                
                 return {
                     "answer": final_answer,
                     "context": initial_context,
@@ -712,6 +696,82 @@ Provide your analysis for each step separately:
                 research_results.append({"step": step, "findings": []})
         
         return research_results
+
+    def _research_steps_parallel_fixed(self, query: str, plan_steps: List[str]) -> List[Dict[str, Any]]:
+        """Process research steps in parallel using ThreadPoolExecutor without asyncio complications"""
+        logger.info(f"Starting parallel research for {len(plan_steps)} steps")
+        start_time = time.time()
+        
+        # Use ThreadPoolExecutor for true parallel processing
+        max_workers = min(len(plan_steps), 3)  # Limit to 3 concurrent workers
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all research tasks
+            future_to_step = {}
+            for step in plan_steps:
+                future = executor.submit(
+                    self._research_single_step,
+                    query, step,
+                    self.max_chunks_per_step,
+                    self.max_findings_per_step,
+                    self.max_tokens_per_finding
+                )
+                future_to_step[future] = step
+            
+            # Collect results as they complete
+            research_results = []
+            completed_count = 0
+            
+            for future in concurrent.futures.as_completed(future_to_step, timeout=120):
+                step = future_to_step[future]
+                completed_count += 1
+                
+                try:
+                    findings = future.result(timeout=60)  # 60 second timeout per step
+                    research_results.append({"step": step, "findings": findings})
+                    
+                    findings_count = len(findings) if isinstance(findings, list) else 0
+                    logger.info(f"Research completed for step ({completed_count}/{len(plan_steps)}): '{step}' - Found {findings_count} findings")
+                    
+                except Exception as e:
+                    logger.error(f"Error researching step '{step}': {str(e)}")
+                    research_results.append({"step": step, "findings": []})
+            
+            # Sort results to maintain step order
+            step_order = {step: i for i, step in enumerate(plan_steps)}
+            research_results.sort(key=lambda x: step_order.get(x["step"], 999))
+        
+        duration = time.time() - start_time
+        logger.info(f"Parallel research completed in {duration:.2f} seconds for {len(research_results)} steps")
+        
+        return research_results
+    
+    def _research_single_step(self, query: str, step: str, max_chunks: int, max_findings: int, max_tokens: int):
+        """Execute research for a single step - designed to be thread-safe"""
+        try:
+            logger.info(f"Researching step: {step}")
+            
+            # Call the researcher agent's research method
+            findings = self.agents["researcher"].research(
+                query, step, 
+                max_chunks,
+                max_findings,
+                max_tokens
+            )
+            
+            # Ensure we return a list
+            if not isinstance(findings, list):
+                if isinstance(findings, dict) and "findings" in findings:
+                    findings = findings["findings"]
+                else:
+                    findings = []
+            
+            return findings
+            
+        except Exception as e:
+            logger.error(f"Error in _research_single_step for '{step}': {str(e)}")
+            return []
+
 def load_config() -> Dict[str, str]:
         """Load configuration from config_oci.yaml"""
         try:
