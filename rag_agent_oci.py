@@ -19,8 +19,6 @@ from langchain_community.embeddings import OCIGenAIEmbeddings
 from langchain_community.llms.oci_generative_ai import OCIGenAI
 from langchain_community.chat_models.oci_generative_ai import ChatOCIGenAI
 from langchain_core.prompts import PromptTemplate
-from langchain.schema.output_parser import StrOutputParser
-from langchain.schema.runnable import RunnablePassthrough
 
 # Local imports
 from agents.agent_factory import create_agents
@@ -38,6 +36,125 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 CONFIG_PROFILE = "DEFAULT"  # Default OCI config profile
+
+# Optimization features - Add caching for LLM and agent initialization
+from functools import lru_cache
+_llm_cache = {}
+_agent_cache = {}
+
+class LLMBatchProcessor:
+    """Handles batch processing of LLM requests for improved performance"""
+    
+    def __init__(self, llm):
+        self.llm = llm
+        self.logger = logging.getLogger(__name__)
+    
+    def batch_process_requests(self, requests: List[Dict[str, Any]], max_concurrent: int = 3) -> List[str]:
+        """
+        Process multiple LLM requests in batches to reduce latency
+        
+        Args:
+            requests: List of dicts with 'messages' and 'type' keys
+            max_concurrent: Maximum number of concurrent requests
+            
+        Returns:
+            List of response strings in the same order as requests
+        """
+        if not requests:
+            return []
+        
+        self.logger.info(f"Processing {len(requests)} LLM requests in batch")
+        start_time = time.time()
+        
+        # For now, we'll use ThreadPoolExecutor for concurrent processing
+        # In the future, this could be enhanced with actual batch API calls
+        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            future_to_index = {}
+            
+            for i, request in enumerate(requests):
+                future = executor.submit(self._process_single_request, request)
+                future_to_index[future] = i
+            
+            # Collect results in order
+            results = [None] * len(requests)
+            from concurrent.futures import as_completed
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    results[index] = future.result()
+                except Exception as e:
+                    self.logger.error(f"Error processing request {index}: {str(e)}")
+                    results[index] = f"Error processing request: {str(e)}"
+        
+        duration = time.time() - start_time
+        self.logger.info(f"Batch processing completed in {duration:.2f} seconds")
+        return results
+    
+    def _process_single_request(self, request: Dict[str, Any]) -> str:
+        """Process a single LLM request"""
+        try:
+            messages = request['messages']
+            response = self.llm.invoke(messages)
+            return response.content if hasattr(response, 'content') else str(response)
+        except Exception as e:
+            self.logger.error(f"Error in single request: {str(e)}")
+            return f"Error: {str(e)}"
+    
+    def batch_reasoning_requests(self, query: str, research_results: List[Dict[str, Any]]) -> List[str]:
+        """Create batch reasoning requests for multiple research results - simplified version"""
+        reasoning_requests = []
+        
+        for result in research_results:
+            if result.get("findings"):
+                findings = result["findings"]
+                context_str = "\n\n".join([f"Context {i+1}:\n{item['content']}" for i, item in enumerate(findings)])
+                
+                # Create simple message structure
+                prompt_text = f"""Analyze the information and draw a clear conclusion for this step.
+                
+                Step: {result["step"]}
+                Context: {context_str}
+                Query: {query}
+
+                Conclusion: Provide the conclusion in plain text format. DO NOT use LaTeX or special formatting."""
+                
+                reasoning_requests.append({
+                    'messages': [{"role": "user", "content": prompt_text}],
+                    'type': 'reasoning',
+                    'step': result["step"]
+                })
+        
+        return self.batch_process_requests(reasoning_requests)
+
+@lru_cache(maxsize=10)  # Priority 3: Cache agent creation
+def get_cached_agents(model_id: str, compartment_id: str, vector_store_id: str):
+    """Get cached agents to avoid repeated initialization"""
+    cache_key = f"{model_id}_{compartment_id}_{vector_store_id}"
+    
+    if cache_key not in _agent_cache:
+        # Create LLM if not cached
+        llm_cache_key = f"{model_id}_{compartment_id}"
+        if llm_cache_key not in _llm_cache:
+            config = load_oci_config()
+            _llm_cache[llm_cache_key] = ChatOCIGenAI(
+                auth_profile=CONFIG_PROFILE,
+                model_id=model_id,
+                compartment_id=compartment_id,
+                service_endpoint="https://inference.generativeai.us-chicago-1.oci.oraclecloud.com",
+                is_stream=False,
+                model_kwargs={"temperature": 0, "max_tokens": 1500}
+            )
+        
+        # Create agents with cached LLM
+        llm = _llm_cache[llm_cache_key]
+        # Note: We can't cache vector_store directly due to connection state
+        # So we'll cache the agents structure but create vector_store fresh
+        _agent_cache[cache_key] = {
+            'llm': llm,
+            'structure': None  # Will be created when vector_store is available
+        }
+    
+    return _agent_cache[cache_key]
 DEBUG = False  # Set to True for detailed debug output
 SERVICE_ENDPOINT = "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com"
 MY_CONFIG_FILE_LOCATION = "~/.oci/config"
@@ -75,21 +192,22 @@ class OCIRAGAgent:
         self.max_findings_per_step = max_findings_per_step
         self.max_tokens_per_finding = max_tokens_per_finding
 
-        # Set up OCI configuration
-        config = load_oci_config()
+        # Priority 3: Use cached LLM and agent initialization
+        vector_store_id = str(hash(str(vector_store))) if vector_store else "none"
+        cached_data = get_cached_agents(model_id, self.compartment_id, vector_store_id)
         
-        self.genai_client = ChatOCIGenAI(
-            auth_profile=CONFIG_PROFILE,
-            model_id=model_id,
-            compartment_id=self.compartment_id,
-            service_endpoint=SERVICE_ENDPOINT,
-            is_stream=use_stream,  # Use streaming if enabled
-            #temperature=TEMPERATURE # old endpoint
-            model_kwargs={"temperature": 0, "max_tokens": 1500 }#, "stop": ["populous"]} # new endpoint
-        )
+        self.genai_client = cached_data['llm']
         
-        # Initialize specialized agents
-        self.agents = create_agents(self.genai_client, vector_store) if use_cot else None
+        # Initialize specialized agents with caching
+        if use_cot:
+            if cached_data['structure'] is None:
+                cached_data['structure'] = create_agents(self.genai_client, vector_store)
+            self.agents = cached_data['structure']
+        else:
+            self.agents = None
+        
+        # Priority 2: Initialize batch processor for LLM operations
+        self.batch_processor = LLMBatchProcessor(self.genai_client)
     
     def process_query(self, query: str) -> Dict[str, Any]:
         """Process a user query using the agentic RAG pipeline"""
@@ -172,8 +290,8 @@ class OCIRAGAgent:
                 logger.info("Falling back to general response")
                 return self._generate_general_response(query)
             
-            # Step 2: Research each step (parallel execution)
-            logger.info("Step 2: Research (parallel execution)")
+            # Step 2: Research each step (parallel execution with optimized batching)
+            logger.info("Step 2: Research (parallel execution with batch optimization)")
             research_start_time = time.time()
             
             plan_steps = [step for step in plan.split("\n") if step.strip()]
@@ -199,28 +317,60 @@ class OCIRAGAgent:
             logger.info("Step 3: Reasoning (batch processing)")
             reasoning_steps = []
             
-            # Fall back to sequential reasoning if batch fails
-            for result in research_results:
-                try:
-                    if self.agents.get("reasoner") and result.get("findings"):  # Check if findings exist
-                        findings = result["findings"] or [{"content": "No specific information found.", 
-                                                       "metadata": {"source": "General Knowledge"}}]
-                        # Only process if we have findings
-                        if findings:
-                            step_reasoning = self.agents["reasoner"].reason(query, result["step"], findings)
-                            reasoning_steps.append(step_reasoning)
-                except Exception as e:
-                    logger.error(f"Error reasoning about step '{result['step']}': {str(e)}")
-                    # Add a fallback reasoning if the step fails
-                    reasoning_steps.append(f"For {result['step']}, insufficient information was found.")
+            # Try batch reasoning first for better performance
+            try:
+                logger.info("Attempting batch reasoning processing")
+                batch_start_time = time.time()
+                
+                # Use the batch processor for reasoning
+                batch_reasoning_results = self.batch_processor.batch_reasoning_requests(query, research_results)
+                
+                # Convert batch results to reasoning steps
+                for i, result in enumerate(batch_reasoning_results):
+                    if result and not result.startswith("Error"):
+                        reasoning_steps.append(result)
+                    else:
+                        logger.warning(f"Batch reasoning failed for step {i+1}, using fallback")
+                        # Fall back to individual reasoning for this step
+                        research_result = research_results[i] if i < len(research_results) else None
+                        if research_result and self.agents.get("reasoner") and research_result.get("findings"):
+                            findings = research_result["findings"] or [{"content": "No specific information found.", 
+                                                                   "metadata": {"source": "General Knowledge"}}]
+                            if findings:
+                                step_reasoning = self.agents["reasoner"].reason(query, research_result["step"], findings)
+                                reasoning_steps.append(step_reasoning)
+                        else:
+                            reasoning_steps.append(f"For {research_result['step'] if research_result else 'unknown step'}, insufficient information was found.")
+                
+                batch_duration = time.time() - batch_start_time
+                logger.info(f"Batch reasoning completed in {batch_duration:.2f} seconds for {len(reasoning_steps)} steps")
+                
+            except Exception as e:
+                logger.error(f"Error in batch reasoning: {str(e)}")
+                logger.info("Falling back to sequential reasoning")
+                
+                # Fall back to sequential reasoning if batch fails
+                for result in research_results:
+                    try:
+                        if self.agents.get("reasoner") and result.get("findings"):  # Check if findings exist
+                            findings = result["findings"] or [{"content": "No specific information found.", 
+                                                           "metadata": {"source": "General Knowledge"}}]
+                            # Only process if we have findings
+                            if findings:
+                                step_reasoning = self.agents["reasoner"].reason(query, result["step"], findings)
+                                reasoning_steps.append(step_reasoning)
+                    except Exception as e:
+                        logger.error(f"Error reasoning about step '{result['step']}': {str(e)}")
+                        # Add a fallback reasoning if the step fails
+                        reasoning_steps.append(f"For {result['step']}, insufficient information was found.")
 
             # Check if we have any reasoning steps before synthesis
             if not reasoning_steps:
                 logger.warning("No valid reasoning steps generated. Using general response.")
                 return self._generate_general_response(query)
             
-            # Step 4: Synthesize final answer with explicit formatting instructions
-            logger.info("Step 4: Synthesis")
+            # Step 4: Synthesize final answer with batch optimization
+            logger.info("Step 4: Synthesis (with batch optimization)")
             # Before synthesis
             logger.info(f"Reasoning steps count: {len(reasoning_steps)}")
             if not reasoning_steps:
@@ -232,11 +382,17 @@ class OCIRAGAgent:
                 logger.info(f"Reasoning step {i+1} type: {type(step)}, length: {len(str(step))}")
             
             try:
-                final_answer = self.agents["synthesizer"].synthesize(query, reasoning_steps)
+                # Use optimized batch synthesis first
+                logger.info("Attempting optimized batch synthesis")
+                final_answer = self._batch_synthesis_optimize(query, reasoning_steps)
                 
                 # Add explicit null check
                 if not final_answer:
-                    logger.error("Empty response from synthesizer")
+                    logger.warning("Empty response from optimized synthesis, falling back to agent synthesis")
+                    final_answer = self.agents["synthesizer"].synthesize(query, reasoning_steps)
+                    
+                if not final_answer:
+                    logger.error("Empty response from both synthesis methods")
                     final_answer = "I was unable to generate a complete answer based on the available information."
                 
                 # Remove LaTeX formatting from final answer
@@ -467,14 +623,12 @@ class OCIRAGAgent:
                 answer += content
             print()  # Add newline after streaming completes
         else:
-            # Non-streaming response
-            chain = (
-                prompt
-                | self.genai_client
-                | StrOutputParser()
-            )
+            # Non-streaming response - use direct LLM invocation
             currtime = time.time()
-            answer = chain.invoke({"query": query, "formatted_context": formatted_context})
+            formatted_prompt = prompt.format(query=query, formatted_context=formatted_context)
+            messages = [{"role": "user", "content": formatted_prompt}]
+            response = self.genai_client.invoke(messages)
+            answer = response.content if hasattr(response, 'content') else str(response)
             logger.info(f"Response from LLM generated in {time.time() - currtime:.2f} seconds")
 
         # Add sources to response if available
@@ -509,18 +663,12 @@ class OCIRAGAgent:
 
     def _generate_general_response(self, query: str) -> Dict[str, Any]:
         """Generate a response using general knowledge when no context is available"""
-        system_prompt = "You are a helpful AI assistant. Answer the following query using your general knowledge."
         user_content = f"Query: {query}\n\nAnswer:"
         
-        prompt = PromptTemplate.from_template(user_content)
-        chain = (
-            {"input": RunnablePassthrough()}
-            | prompt
-            | self.genai_client
-            | StrOutputParser()
-        )
         currtime = time.time()
-        answer = chain.invoke({"query": query})
+        messages = [{"role": "user", "content": user_content}]
+        response = self.genai_client.invoke(messages)
+        answer = response.content if hasattr(response, 'content') else str(response)
         logger.info(f"General response generated in {time.time() - currtime:.2f} seconds")
         # Return a general response without context
         
@@ -772,6 +920,63 @@ Provide your analysis for each step separately:
             logger.error(f"Error in _research_single_step for '{step}': {str(e)}")
             return []
 
+    def _batch_synthesis_optimize(self, query: str, reasoning_steps: List[str]) -> str:
+        """
+        Optimized synthesis using batch processing when possible
+        
+        Args:
+            query: The original query
+            reasoning_steps: List of reasoning step results
+            
+        Returns:
+            Final synthesized answer
+        """
+        logger.info("Using optimized batch synthesis")
+        start_time = time.time()
+        
+        try:
+            # For synthesis, we typically need to combine all steps in one go
+            # So we'll prepare a single optimized prompt that processes all steps together
+            if not reasoning_steps:
+                return "I don't have enough valid analysis to provide a complete answer."
+            
+            # Create steps_str with optimization
+            steps_str = "\n\n".join([f"Step {i+1}:\n{step}" for i, step in enumerate(reasoning_steps)])
+            
+            # Use a streamlined prompt for faster processing
+            synthesis_prompt = f"""Combine the reasoning steps into a clear, comprehensive answer.
+
+Query: {query}
+Steps: {steps_str}
+
+Provide a direct, clear answer in plain text format. DO NOT use LaTeX notation, mathematical symbols like \\boxed{{}}, or markdown formatting.
+
+Answer:"""
+            
+            # Direct LLM call with optimized message structure
+            messages = [{"role": "user", "content": synthesis_prompt}]
+            response = self.genai_client.invoke(messages)
+            
+            # Handle different response formats
+            if hasattr(response, "content"):
+                result = response.content
+            elif isinstance(response, dict) and "content" in response:
+                result = response["content"]
+            elif isinstance(response, str):
+                result = response
+            else:
+                result = str(response)
+            
+            duration = time.time() - start_time
+            logger.info(f"Optimized batch synthesis completed in {duration:.2f} seconds")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in batch synthesis optimization: {str(e)}")
+            # Fall back to agent-based synthesis
+            return self.agents["synthesizer"].synthesize(query, reasoning_steps)
+
 def load_config() -> Dict[str, str]:
         """Load configuration from config_oci.yaml"""
         try:
@@ -801,14 +1006,17 @@ def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
         use_cot = request.get("use_cot", False)
 
         logger.info(f"Use Chain of Thought reasoning: {use_cot}")
-        #use_cot = request["use_cot"] or credentials.get("USE_COT", "false").lower() == "true"
 
         # Check for OCI compartment ID
         if not compartment_id:
             print("✗ Error: OCI_COMPARTMENT_ID not found in config file or command line arguments")
             print("Please set the OCI_COMPARTMENT_ID in config file or provide --compartment-id")
             exit(1)
-            # Determine which model to us
+            
+        # Priority 3: Warm cache for better initialization performance
+        logger.info("Warming LLM and agent caches for optimal performance")
+        OCIRAGAgent.warm_cache(model_id, compartment_id, [vector_db])
+        
         #Create vector store based on vector_db type
         if vector_db == "oracle":
             if not ORACLE_DB_AVAILABLE:
@@ -827,7 +1035,7 @@ def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
     
             # Use default OCI model
         logger.info(f"Using model: {model_id} for collection: {collection} and compartment: {compartment_id} and use_cot {use_cot}")
-        # Initialize the RAG agent with the vector store and model    
+        # Initialize the RAG agent with the vector store and model (now with optimizations)    
         rag_agent = OCIRAGAgent(
                 vector_store=vector_db,
                 use_cot=use_cot,
@@ -839,6 +1047,10 @@ def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
                 max_findings_per_step=3,
                 max_tokens_per_finding=1000
             )
+        
+        # Log cache stats for monitoring optimization effectiveness
+        cache_stats = rag_agent.get_cache_stats()
+        logger.info(f"Cache statistics: {cache_stats}")
         
         response = rag_agent.process_query(request["query"])
         # In the main function, add this check before printing the answer
