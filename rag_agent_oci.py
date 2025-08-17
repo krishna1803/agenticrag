@@ -4,14 +4,25 @@ import json
 import os
 import argparse
 import logging
-from dotenv import load_dotenv
 import time
 import asyncio
 import concurrent.futures
+import re
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import yaml
-import re
+from functools import lru_cache
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv():
+        pass
 
 # OCI imports
 import oci
@@ -208,6 +219,68 @@ class OCIRAGAgent:
         
         # Priority 2: Initialize batch processor for LLM operations
         self.batch_processor = LLMBatchProcessor(self.genai_client)
+    
+    @classmethod
+    def warm_cache(cls, model_id: str, compartment_id: str, vector_store_types: List[str] = None):
+        """
+        Warm up the LLM and agent caches for faster initialization
+        
+        Args:
+            model_id: OCI model ID to cache
+            compartment_id: OCI compartment ID
+            vector_store_types: List of vector store types to preload
+        """
+        logger.info(f"Warming cache for model {model_id} in compartment {compartment_id}")
+        start_time = time.time()
+        
+        # Default vector store types if not specified
+        if vector_store_types is None:
+            vector_store_types = ["oracle", "postgres"]
+        
+        try:
+            # Pre-create LLM instance
+            llm_cache_key = f"{model_id}_{compartment_id}"
+            if llm_cache_key not in _llm_cache:
+                config = load_oci_config()
+                _llm_cache[llm_cache_key] = ChatOCIGenAI(
+                    auth_profile=CONFIG_PROFILE,
+                    model_id=model_id,
+                    compartment_id=compartment_id,
+                    service_endpoint="https://inference.generativeai.us-chicago-1.oci.oraclecloud.com",
+                    is_stream=False,
+                    model_kwargs={"temperature": 0, "max_tokens": 1500}
+                )
+                
+            # Pre-create agent structures for different vector store combinations
+            for vs_type in vector_store_types:
+                cache_key = f"{model_id}_{compartment_id}_{vs_type}"
+                if cache_key not in _agent_cache:
+                    _agent_cache[cache_key] = {
+                        'llm': _llm_cache[llm_cache_key],
+                        'structure': None  # Will be created when actual vector_store is available
+                    }
+            
+            duration = time.time() - start_time
+            logger.info(f"Cache warming completed in {duration:.2f} seconds")
+            
+        except Exception as e:
+            logger.error(f"Error warming cache: {str(e)}")
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get statistics about the current cache state"""
+        return {
+            "llm_cache_size": len(_llm_cache),
+            "agent_cache_size": len(_agent_cache),
+            "llm_cache_keys": list(_llm_cache.keys()),
+            "agent_cache_keys": list(_agent_cache.keys())
+        }
+    
+    def clear_cache(self):
+        """Clear all cached LLMs and agents"""
+        global _llm_cache, _agent_cache
+        _llm_cache.clear()
+        _agent_cache.clear()
+        logger.info("All caches cleared")
     
     def process_query(self, query: str) -> Dict[str, Any]:
         """Process a user query using the agentic RAG pipeline"""
@@ -984,6 +1057,10 @@ def load_config() -> Dict[str, str]:
             if not config_path.exists():
                 print("Warning: config_oci.yaml not found. Using empty configuration.")
                 return {}
+            
+            if yaml is None:
+                print("Warning: yaml module not available. Cannot load config file.")
+                return {}
                 
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f)
@@ -1106,11 +1183,11 @@ def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
                     file_path = ctx["metadata"].get("file_path", "Unknown")
                     print(f"[{i+1}] {source} (file: {file_path})")
                 
-               
         # Return the response dictionary
-        
         return response
     except Exception as e:
+        logger.error(f"Error processing request: {str(e)}")
+        return {"error": str(e)}
         logger.error(f"Error processing request: {str(e)}")
         return {"error": str(e)}
 
