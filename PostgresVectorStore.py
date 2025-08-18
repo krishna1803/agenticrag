@@ -193,7 +193,7 @@ class PostgresVectorStore(VectorStore):
         print("Getting embeddings from Postgres vector store...")
         return self._embedding_function
 
-    def query_pdf_collection(self, query: str, n_results: int = 3) -> List[Dict[str, Any]]:
+    def query_pdf_collection(self, query: str, n_results: int = 10) -> List[Dict[str, Any]]:
         """Query the PDF documents collection"""
         start_time = time.time()
         print("🔍 [Postgres] Querying PDF Collection")
@@ -247,7 +247,7 @@ class PostgresVectorStore(VectorStore):
     # similarity_search
     #
     def similarity_search(
-        self, query: str, k: int = 3
+        self, query: str, k: int = 10
     ) -> List[Dict[str, Any]]:
         """Return docs most similar to query."""
         logging.info(f"Similarity Search for Postgres Vector Store")
@@ -269,7 +269,7 @@ class PostgresVectorStore(VectorStore):
             # Fallback to custom search
             return self._custom_similarity_search(query, k)
     
-    def _custom_similarity_search(self, query: str, k: int = 3) -> List[Dict[str, Any]]:
+    def _custom_similarity_search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
         """Custom similarity search implementation as fallback"""
         logging.info(f"Using custom similarity search for Postgres Vector Store")
 
