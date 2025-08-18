@@ -337,19 +337,32 @@ class OCIRAGAgent:
         """Process a user query using the agentic RAG pipeline"""
         logger.info(f"Processing query with collection: {self.collection}")
         
-        # Process based on collection type and CoT setting
-        if self.collection == "General Knowledge":
-            # For General Knowledge, directly use general response
-            if self.use_cot:
-                return self._process_query_with_cot(query)
+        try:
+            # Process based on collection type and CoT setting
+            if self.collection == "General Knowledge":
+                # For General Knowledge, directly use general response
+                if self.use_cot:
+                    return self._process_query_with_cot(query)
+                else:
+                    return self._generate_general_response(query)
             else:
-                return self._generate_general_response(query)
-        else:
-            # For PDF or Repository collections, use context-based processing
-            if self.use_cot:
-                return self._process_query_with_cot(query)
-            else:
-                return self._process_query_standard(query)
+                # For PDF or Repository collections, use context-based processing
+                if self.use_cot:
+                    return self._process_query_with_cot(query)
+                else:
+                    return self._process_query_standard(query)
+        except Exception as e:
+            logger.error(f"Error processing query '{query}': {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+            # Return a valid response structure even on error
+            error_message = f"I apologize, but I encountered an error while processing your query: {str(e)}"
+            return {
+                "answer": error_message,
+                "context": [],
+                "error": str(e)
+            }
     
     def _process_query_with_cot(self, query: str) -> Dict[str, Any]:
         """Process query using Chain of Thought reasoning with multiple agents"""
@@ -1152,9 +1165,17 @@ Answer:"""
         """Get context with optional predicate filtering for enhanced search precision"""
         try:
             # Extract predicate from query if available
+            if not hasattr(self, 'search_filter_extractor') or self.search_filter_extractor is None:
+                logger.warning("SearchFilterExtractor not available, falling back to standard search")
+                return self._fallback_context_retrieval(query, collection)
+            
             predicate, predicate_values = self.search_filter_extractor.extract_predicate_from_query(query)
             
             logger.info(f"Extracted predicate: '{predicate}' with values: {predicate_values}")
+            
+            # Ensure predicate_values is not None
+            if predicate_values is None:
+                predicate_values = {}
             
             if collection == "PDF Collection":
                 # Check if vector store supports predicate-based querying
@@ -1188,7 +1209,14 @@ Answer:"""
                 
         except Exception as e:
             logger.error(f"Error in predicate-based context retrieval: {str(e)}")
+            import traceback
+            traceback.print_exc()
             # Fallback to standard search
+            return self._fallback_context_retrieval(query, collection)
+    
+    def _fallback_context_retrieval(self, query: str, collection: str) -> List[Dict[str, Any]]:
+        """Fallback context retrieval method when predicate-based search fails"""
+        try:
             if collection == "PDF Collection":
                 return self.vector_store.query_pdf_collection(query, n_results=self.max_results)
             elif collection == "Repository Collection":
@@ -1198,7 +1226,11 @@ Answer:"""
             elif collection == "General Collection":
                 return self.vector_store.query_general_collection(query, n_results=self.max_results)
             else:
+                logger.warning(f"Unknown collection in fallback: {collection}")
                 return []
+        except Exception as e:
+            logger.error(f"Error in fallback context retrieval: {str(e)}")
+            return []
 
 def load_config() -> Dict[str, Any]:
         """Load configuration from config_oci.yaml with default values"""

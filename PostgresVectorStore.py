@@ -222,36 +222,7 @@ class PostgresVectorStore(VectorStore):
             traceback.print_exc()
             return []
 
-    def query_pdf_collection_with_predicate(self, query: str, predicate: str = "", predicate_values: Optional[Dict] = None, n_results: int = 10) -> List[Dict[str, Any]]:
-        """Query the PDF documents collection with predicate filtering"""
-        start_time = time.time()
-        print("🔍 [Postgres] Querying PDF Collection with Predicate")
-        logging.info(f"Starting PDF collection query with predicate for: '{query[:50]}...' with n_results={n_results}")
-        
-        try:
-            # Use similarity search with predicate filtering
-            formatted_results = self.similarity_search(query, k=n_results, predicate=predicate, predicate_values=predicate_values)
-            
-            duration = time.time() - start_time
-            
-            if not formatted_results:
-                logging.warning(f"No results found for query with predicate in {duration:.2f}s")
-                print("No results found for the query with predicate.")
-                return []
-                
-            logging.info(f"🔍 [Postgres] Retrieved {len(formatted_results)} chunks from PDF Collection with predicate in {duration:.2f}s")
-            print(f"🔍 [Postgres] Retrieved {len(formatted_results)} chunks from PDF Collection with predicate in {duration:.2f}s")
-            return formatted_results
-            
-        except Exception as e:
-            duration = time.time() - start_time
-            logging.error(f"Error in query_pdf_collection_with_predicate after {duration:.2f}s: {str(e)}")
-            print(f"Error in query_pdf_collection_with_predicate: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return []
-
-    def query_pdf_collection_with_predicate(self, query: str, n_results: int = 10, predicate: str = "", predicate_values: Dict = None) -> List[Dict[str, Any]]:
+    def query_pdf_collection_with_predicate(self, query: str, n_results: int = 10, predicate: str = "", predicate_values: Optional[Dict] = None) -> List[Dict[str, Any]]:
         """Query the PDF documents collection with optional predicate filtering"""
         start_time = time.time()
         print("🔍 [Postgres] Querying PDF Collection with predicate filtering")
@@ -338,7 +309,7 @@ class PostgresVectorStore(VectorStore):
     
     
     def _custom_similarity_search_with_predicate(self, query: str, k: int = 10, predicate: str = "", predicate_values: Dict = None) -> List[Dict[str, Any]]:
-        """Custom similarity search implementation with predicate filtering"""
+        """Custom similarity search implementation with predicate filtering using PGVector table structure"""
         logging.info(f"Using custom similarity search with predicate for Postgres Vector Store")
 
         # Get the embedding for the query using the same model that created the embeddings
@@ -359,56 +330,83 @@ class PostgresVectorStore(VectorStore):
                 print(f"Using embedding vector: {embedding_str[:50]}...")
                 print(f"Using predicate: {predicate}")
                 
+                # Get the actual collection table name used by PGVector
+                collection_table = f"langchain_pg_embedding"
+                
                 # Build the WHERE clause if predicate is provided
                 where_clause = ""
                 if predicate:
-                    where_clause = f" WHERE {predicate}"
+                    where_clause = f" AND {predicate}"
                 
-                # Use the working SQL query structure with optional predicate
-                search_query = f"""SELECT a.source, a.content, b.doc_id, b.chunk_metadata, b.vector <=> '{embedding_str}'::vector({embedding_dim}) AS distance
-                                FROM documents a JOIN embeddings b ON a.id = b.doc_id{where_clause}
-                                ORDER BY distance
-                                LIMIT {k}; """
+                # Use PGVector table structure: document (text), cmetadata (jsonb), embedding (vector)
+                search_query = f"""
+                    SELECT document, cmetadata, embedding <=> %s::vector({embedding_dim}) AS distance
+                    FROM {collection_table}
+                    WHERE 1=1{where_clause}
+                    ORDER BY embedding <=> %s::vector({embedding_dim})
+                    LIMIT %s
+                """
 
                 print(f"Executing search query with predicate...")
-                result = conn.execute(text(search_query), predicate_values)
+                # Prepare parameters - embedding vector needs to be first for both comparisons
+                query_params = [embedding_str, embedding_str, k]
+                
+                # Add predicate values if any
+                if predicate_values:
+                    # We need to modify the query to use named parameters for predicate values
+                    # Convert to named parameter format
+                    search_query_named = f"""
+                        SELECT document, cmetadata, embedding <=> %(embedding)s::vector({embedding_dim}) AS distance
+                        FROM {collection_table}
+                        WHERE 1=1{where_clause}
+                        ORDER BY embedding <=> %(embedding)s::vector({embedding_dim})
+                        LIMIT %(limit_val)s
+                    """
+                    combined_params = {
+                        "embedding": embedding_str,
+                        "limit_val": k,
+                        **predicate_values
+                    }
+                    result = conn.execute(text(search_query_named), combined_params)
+                else:
+                    result = conn.execute(text(search_query), query_params)
+                    
                 rows = result.fetchall()
         
-                # Format results
+                # Format results using PGVector structure
                 formatted_results = []
                 for row in rows:
-                    source = row[0]
-                    content = row[1]
-                    doc_id = row[2]
-                    chunk_metadata = row[3]
-                    distance = row[4]
+                    document = row[0]  # document text
+                    cmetadata = row[1]  # metadata as jsonb
+                    distance = row[2]   # similarity distance
                     
-                    # Process metadata - either parse JSON or use as is
-                    if isinstance(chunk_metadata, str):
+                    # Process metadata - PGVector stores as jsonb, so it should already be a dict
+                    if isinstance(cmetadata, dict):
+                        base_metadata = cmetadata
+                    elif isinstance(cmetadata, str):
                         try:
-                            base_metadata = json.loads(chunk_metadata)
+                            base_metadata = json.loads(cmetadata)
                         except json.JSONDecodeError:
-                            base_metadata = {"raw_metadata": chunk_metadata}
-                    elif chunk_metadata is None:
+                            base_metadata = {"raw_metadata": cmetadata}
+                    elif cmetadata is None:
                         base_metadata = {}
                     else:
-                        base_metadata = chunk_metadata
+                        base_metadata = dict(cmetadata) if hasattr(cmetadata, '__dict__') else {"raw_metadata": str(cmetadata)}
                     
-                    # Add source and doc_id to metadata
+                    # Add similarity score to metadata
                     enhanced_metadata = {
                         **base_metadata,
-                        "source": source,
-                        "page_numbers": doc_id,
                         "similarity_score": float(distance)
                     }
                     
                     # Create the formatted result
                     result_item = {
-                        "content": content,
+                        "content": document,
                         "metadata": enhanced_metadata
                     }
 
-                    print(f"Document from: {source}, Page Numbers: {doc_id}, Score: {distance}")
+                    source = enhanced_metadata.get("source", "Unknown")
+                    print(f"Document from: {source}, Score: {distance}")
                     formatted_results.append(result_item)
                 
                 print(f"🔍 [PostgresDB] Retrieved {len(formatted_results)} chunks with predicate filtering")
@@ -422,7 +420,7 @@ class PostgresVectorStore(VectorStore):
             return self._custom_similarity_search(query, k)
     
     def _custom_similarity_search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
-        """Custom similarity search implementation as fallback"""
+        """Custom similarity search implementation as fallback using PGVector table structure"""
         logging.info(f"Using custom similarity search for Postgres Vector Store")
 
         # Get the embedding for the query using the same model that created the embeddings
@@ -439,51 +437,55 @@ class PostgresVectorStore(VectorStore):
                 
                 print(f"Using embedding vector: {embedding_str[:50]}...")
                 
-                # Use the working SQL query structure
-                search_query = f"""SELECT a.source, a.content, b.doc_id, b.chunk_metadata, b.vector <=> '{embedding_str}'::vector({embedding_dim}) AS distance
-                                FROM documents a JOIN embeddings b ON a.id = b.doc_id
-                                ORDER BY distance
-                                LIMIT {k}; """
+                # Get the actual collection table name used by PGVector
+                collection_table = f"langchain_pg_embedding"
+                
+                # Use PGVector table structure: document (text), cmetadata (jsonb), embedding (vector)
+                search_query = f"""
+                    SELECT document, cmetadata, embedding <=> %s::vector({embedding_dim}) AS distance
+                    FROM {collection_table}
+                    ORDER BY embedding <=> %s::vector({embedding_dim})
+                    LIMIT %s
+                """
 
                 print(f"Executing search query...")
-                result = conn.execute(text(search_query))
+                result = conn.execute(text(search_query), [embedding_str, embedding_str, k])
                 rows = result.fetchall()
         
-                # Format results
+                # Format results using PGVector structure
                 formatted_results = []
                 for row in rows:
-                    source = row[0]
-                    content = row[1]
-                    doc_id = row[2]
-                    chunk_metadata = row[3]
-                    distance = row[4]
+                    document = row[0]  # document text
+                    cmetadata = row[1]  # metadata as jsonb
+                    distance = row[2]   # similarity distance
                     
-                    # Process metadata - either parse JSON or use as is
-                    if isinstance(chunk_metadata, str):
+                    # Process metadata - PGVector stores as jsonb, so it should already be a dict
+                    if isinstance(cmetadata, dict):
+                        base_metadata = cmetadata
+                    elif isinstance(cmetadata, str):
                         try:
-                            base_metadata = json.loads(chunk_metadata)
+                            base_metadata = json.loads(cmetadata)
                         except json.JSONDecodeError:
-                            base_metadata = {"raw_metadata": chunk_metadata}
-                    elif chunk_metadata is None:
+                            base_metadata = {"raw_metadata": cmetadata}
+                    elif cmetadata is None:
                         base_metadata = {}
                     else:
-                        base_metadata = chunk_metadata
+                        base_metadata = dict(cmetadata) if hasattr(cmetadata, '__dict__') else {"raw_metadata": str(cmetadata)}
                     
-                    # Add source and doc_id to metadata
+                    # Add similarity score to metadata
                     enhanced_metadata = {
                         **base_metadata,
-                        "source": source,
-                        "page_numbers": doc_id,
                         "similarity_score": float(distance)
                     }
                     
                     # Create the formatted result
                     result_item = {
-                        "content": content,
+                        "content": document,
                         "metadata": enhanced_metadata
                     }
 
-                    print(f"Document from: {source}, Page Numbers: {doc_id}, Score: {distance}")
+                    source = enhanced_metadata.get("source", "Unknown")
+                    print(f"Document from: {source}, Score: {distance}")
                     formatted_results.append(result_item)
                 
                 print(f"🔍 [PostgresDB] Retrieved {len(formatted_results)} chunks from PDF Collection")

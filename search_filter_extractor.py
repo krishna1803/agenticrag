@@ -71,10 +71,12 @@ class SearchFilterExtractor:
                 "value": "journal"
             })
         
-        # Extract jurisdiction filters
+        # Extract jurisdiction filters (ensure word boundaries to avoid false matches)
         jurisdictions = ["federal", "nsw", "vic", "qld", "wa", "sa", "tas", "nt", "act"]
         for jurisdiction in jurisdictions:
-            if jurisdiction in query_lower:
+            # Use word boundaries to avoid matching "nt" in "contract"
+            pattern = r'\b' + re.escape(jurisdiction) + r'\b'
+            if re.search(pattern, query_lower):
                 filters.append({
                     "attribute": "jurisdiction",
                     "equality": "eq",
@@ -83,9 +85,9 @@ class SearchFilterExtractor:
                 break
         
         return filters
-    
+
     def generate_search_predicate(self, search_filters: List[Dict]) -> Tuple[str, Dict]:
-        """Generate a SQL predicate from the supplied filters.
+        """Generate a SQL predicate from the supplied filters compatible with PGVector cmetadata structure.
         
         Args:
             search_filters: List of filter dictionaries
@@ -107,7 +109,7 @@ class SearchFilterExtractor:
                 
             # Source and court have some special handling
             if att_filter.get("attribute") == "source" and att_filter.get("equality") == "eq":
-                # Approximate match using 'ILIKE'
+                # Approximate match using 'ILIKE' - adapted for PGVector cmetadata structure
                 source_name = att_filter.get("value", "").strip()
                 year_matches = re.search(r"(?:\[|\()?(\d{4})(?:\]|\)?)$", source_name)
                 if year_matches is not None:
@@ -122,7 +124,7 @@ class SearchFilterExtractor:
             if att_filter.get("attribute") == "court":
                 continue
                 
-            # Common legal document attributes
+            # Common legal document attributes for PGVector cmetadata structure
             filter_attributes = ["type", "jurisdiction", "date", "database", "name", "title"]
                 
             if att_filter.get("attribute") in filter_attributes:
@@ -146,8 +148,16 @@ class SearchFilterExtractor:
         Returns:
             Tuple of (SQL predicate string, values dictionary)
         """
-        filters = self.extract_simple_filters_from_query(query)
-        if not filters:
-            return "", {}
+        try:
+            filters = self.extract_simple_filters_from_query(query)
+            if not filters:
+                logger.info(f"No filters extracted from query: {query}")
+                return "", {}
+                
+            predicate, values = self.generate_search_predicate(filters)
+            logger.info(f"Extracted predicate '{predicate}' with values {values} from query: {query}")
+            return predicate, values
             
-        return self.generate_search_predicate(filters)
+        except Exception as e:
+            logger.error(f"Error extracting predicate from query '{query}': {str(e)}")
+            return "", {}
