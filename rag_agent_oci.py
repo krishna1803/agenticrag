@@ -238,7 +238,7 @@ class OCIRAGAgent:
         
         # Set response quality parameters from config
         quality_config = self.config.get("RESPONSE_QUALITY", {})
-        self.max_plan_steps = quality_config.get("MAX_PLAN_STEPS", 3)
+        self.max_plan_steps = quality_config.get("MAX_PLAN_STEPS", 10)
         self.remove_latex = quality_config.get("REMOVE_LATEX_FORMATTING", True)
         self.enable_validation = quality_config.get("ENABLE_VALIDATION", True)
         self.fallback_on_error = quality_config.get("FALLBACK_ON_ERROR", True)
@@ -394,7 +394,7 @@ class OCIRAGAgent:
                 logger.info("Using General Knowledge collection, no context retrieval needed")
             
             # Apply token budget to context
-            initial_context = self._limit_context(initial_context, max_tokens=12000)
+            initial_context = self._limit_context(initial_context, max_tokens=40000)
             
             # Step 1: Planning - Get steps to follow
             logger.info("Step 1: Planning")
@@ -1181,7 +1181,7 @@ def load_config() -> Dict[str, Any]:
             "RESPONSE_QUALITY": {
                 "REMOVE_LATEX_FORMATTING": True,
                 "ENABLE_VALIDATION": True,
-                "MAX_PLAN_STEPS": 3,
+                "MAX_PLAN_STEPS": 10,
                 "FALLBACK_ON_ERROR": True
             },
             "LOGGING": {
