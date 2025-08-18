@@ -336,6 +336,7 @@ class PostgresVectorStore(VectorStore):
             # Fallback to custom search without predicate
             return self._custom_similarity_search(query, k)
     
+    
     def _custom_similarity_search_with_predicate(self, query: str, k: int = 10, predicate: str = "", predicate_values: Dict = None) -> List[Dict[str, Any]]:
         """Custom similarity search implementation with predicate filtering"""
         logging.info(f"Using custom similarity search with predicate for Postgres Vector Store")
