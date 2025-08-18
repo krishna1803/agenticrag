@@ -375,15 +375,33 @@ class OCIRAGAgent:
             # Use predicate-based context retrieval
             logger.info(f"Retrieving context from {self.collection} for query: '{query}'")
             context_chunks = self._get_context_with_predicate_filtering(query, self.collection)
+            
+            # Ensure context_chunks is not None
+            if context_chunks is None:
+                logger.warning("Context chunks is None, using empty list")
+                context_chunks = []
+            
             initial_context.extend(context_chunks)
             logger.info(f"Retrieved {len(context_chunks)} chunks from {self.collection}")
             
             # Log each chunk with citation number but not full content
             for i, chunk in enumerate(context_chunks):
-                source = chunk["metadata"].get("source", "Unknown")
-                pages = chunk["metadata"].get("page_numbers", [])
+                # Add safety check for chunk structure
+                if not chunk or not isinstance(chunk, dict):
+                    logger.warning(f"Invalid chunk at index {i}: {chunk}")
+                    continue
+                    
+                metadata = chunk.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    logger.warning(f"Invalid metadata at index {i}: {metadata}")
+                    metadata = {}
+                    
+                source = metadata.get("source", "Unknown")
+                pages = metadata.get("page_numbers", [])
                 logger.info(f"Source [{i+1}]: {source} (pages: {pages})")
-                content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
+                
+                content = chunk.get("content", "")
+                content_preview = content[:150] + "..." if len(content) > 150 else content
                 logger.info(f"Content preview for source [{i+1}]: {content_preview}")
                 
         except Exception as e:
@@ -631,13 +649,31 @@ class OCIRAGAgent:
         try:
             logger.info(f"Retrieving context from {self.collection} for query: '{query}'")
             context = self._get_context_with_predicate_filtering(query, self.collection)
+            
+            # Ensure context is not None
+            if context is None:
+                logger.warning("Context is None, using empty list")
+                context = []
+                
             logger.info(f"Retrieved {len(context)} chunks from {self.collection}")
             
             for i, chunk in enumerate(context):
-                source = chunk["metadata"].get("source", "Unknown")
-                pages = chunk["metadata"].get("page_numbers", [])
+                # Add safety check for chunk structure
+                if not chunk or not isinstance(chunk, dict):
+                    logger.warning(f"Invalid chunk at index {i}: {chunk}")
+                    continue
+                    
+                metadata = chunk.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    logger.warning(f"Invalid metadata at index {i}: {metadata}")
+                    metadata = {}
+                    
+                source = metadata.get("source", "Unknown")
+                pages = metadata.get("page_numbers", [])
                 logger.info(f"Source [{i+1}]: {source} (pages: {pages})")
-                content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
+                
+                content = chunk.get("content", "")
+                content_preview = content[:150] + "..." if len(content) > 150 else content
                 logger.debug(f"Content preview for source [{i+1}]: {content_preview}")
                 
         except Exception as e:
@@ -653,6 +689,11 @@ class OCIRAGAgent:
                 elif self.collection == "Web Knowledge Base":
                     logger.info(f"Fallback: Retrieving context from Web Knowledge Base for query: '{query}'")
                     context = self.vector_store.query_web_collection(query)
+                
+                # Ensure context is not None
+                if context is None:
+                    logger.warning("Fallback context is None, using empty list")
+                    context = []
                     
                 logger.info(f"Retrieved {len(context)} chunks from {self.collection} (fallback)")
             except Exception as fallback_error:
@@ -671,182 +712,238 @@ class OCIRAGAgent:
     
     def _generate_response(self, query: str, context: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Generate a response based on the query and context using OCI Generative AI"""
-        # Format context for the prompt
-        formatted_context = "\n\n".join([f"Context {i+1}:\n{item['content']}" 
-                                       for i, item in enumerate(context)])
-        
-        #system_prompt = """You are an AI assistant answering questions based on the provided context.
-#Answer the question based on the context provided. If the answer is not in the context, say "I don't have enough information to answer this question." Be concise and accurate."""
-        
-        #user_content = f"Context:\n{formatted_context}\n\nQuestion: {query}"
-        
-        prompt_template = """## AustLII AI Legal Research Assistant - System Instructions
-
-            You are a legal research assistant. Your task is to answer ONLY from the retrieved legal documents and references and citations provided below.
-
-            **Critical Constraints:**
-            - Do NOT use outside knowledge unless explicitly authorised.
-            - Do NOT reference legal principles, legislation, or cases not mentioned in the provided documents.
-            - Do NOT add missing details to citations or complete partial references.
-            - Do not make assumptions, guesses, or inferences beyond the text.
-            - Do NOT invent content.
-            - If you find yourself drawing on legal knowledge beyond the documents, stop and use the fallback response.
-
-            **If the answer is not in the provided documents, respond exactly with:**
-            - "I do not have enough information to address your query."
-
-            You must follow the Response Rules exactly.
-
-            ---
-
-            ## Query or Task
-            {query}
-
-            ---
-
-            ## Retrieved Documents
-            The following legal documents were retrieved from AustLII. These are your only sources. Refer to them as [#].
-
-            {formatted_context}
-
-
-            ---
-
-            ## Response Rules
-
-            Unless the user asks for 'explanation,' limit the response to a direct answer to the query and no need to output the explanation of each step below.
-
-            1. **Evidence-first approach**
-            - Identify and quote/paraphrase only relevant sections from the provided documents.
-            - Attribute every quote/paraphrase to [#].
-
-            2. **Summary step**
-            - Summarise the key points from the identified sections.
-            - Do not add interpretation beyond what is explicitly in the documents.
-
-            3. **Final answer construction**
-            - Write your final answer strictly from the summary in step 2.
-            - Every factual claim must be supported by a [#] citation.
-
-            4. **Response format**
-            - Unless the user asks for 'explanation,' limit the response to a direct answer to the query subject to length limits in Response Requirements.
-            - When asked for 'explanation,' provide a step-by-step breakdown.
-
-            5. **Response Requirements**
-            Length Limits:
-            - Simple factual queries: 1-2 sentences maximum
-            - Case summaries: 2-3 sentences maximum
-            - Multi-part questions: Up to 5 sentences maximum
-            - Complex analysis (explicit user request): Up to 8 sentences maximum
-            - Document comparisons: Up to 6 sentences maximum
-
-            When More Detail is Needed:
-            If user requires comprehensive information, respond with available details within limits, then add: "For additional analysis, please ask specific follow-up questions about [list 2-3 specific aspects mentioned in documents]."
-
-            Override Conditions:
-            Exceed sentence limits ONLY when:
-            - Documents contain extensive directly quoted relevant material on the exact query
-            - User explicitly requests "detailed analysis with all available information"
-            - Multiple documents provide substantial overlapping content on the same narrow topic
-
-            6. **Style and formatting**
-            - Use Australian English and formal legal language.
-            - First mention of a case → full case name and citation
-            - First mention of legislation → short title + jurisdiction
-
-            7. **If no answer is found**
-            - Reply: "I do not have enough information to address your query."
-            - Do not guess or infer.
-
-            ---
-
-            ## Self-check before final output
-            - Have I used ONLY the provided documents?
-            - Does every factual claim have a [#] citation?
-            - Have I avoided assumptions or external knowledge?
-            - Have I avoided referencing cases, legislation, or legal principles not mentioned in the documents?
-            - Have I avoided adding or completing citation/reference details not in the documents?
-            - Have I used Australian English and the required citation format?
-            """
-
-        prompt = PromptTemplate.from_template(prompt_template)
-        
-        logger.info("Generating response using OCI Generative AI")
-        logger.info(f"Query: {query}")
-        logger.info(f"Context size: {len(formatted_context)} characters")
-        logger.info(f"prompt: {prompt_template}")
-        
-        if self.use_stream:
-            print("Generating streaming response...")
-            chain = (
-                prompt
-                | self.genai_client
-            )
-            currtime = time.time()
-            response = chain.invoke({"query": query,"formatted_context": formatted_context})
-            logger.info(f"Response from LLM generated in {time.time() - currtime:.2f} seconds")
-            # For streaming, we need to collect the tokens
-            answer = ""
-            for chunk in response:
-                content = chunk.content if hasattr(chunk, "content") else str(chunk)
-                print(content, end="", flush=True)
-                answer += content
-            print()  # Add newline after streaming completes
-        else:
-            # Non-streaming response - use direct LLM invocation
-            currtime = time.time()
-            formatted_prompt = prompt.format(query=query, formatted_context=formatted_context)
-            messages = [{"role": "user", "content": formatted_prompt}]
-            response = self.genai_client.invoke(messages)
-            answer = response.content if hasattr(response, 'content') else str(response)
-            logger.info(f"Response from LLM generated in {time.time() - currtime:.2f} seconds")
-
-        # Add sources to response if available
-        sources = {}
-        if context:
-            # Group sources by document
-            for item in context:
-                source = item['metadata'].get('source', 'Unknown')
-                if source not in sources:
-                    sources[source] = set()
-                
-                # Add page number if available
-                if 'page' in item['metadata']:
-                    sources[source].add(str(item['metadata']['page']))
-                # Add file path if available for code
-                if 'file_path' in item['metadata']:
-                    sources[source] = item['metadata']['file_path']
+        try:
+            # Format context for the prompt
+            formatted_context = ""
+            if context:
+                context_parts = []
+                for i, item in enumerate(context):
+                    # Ensure item is a dict and has required fields
+                    if isinstance(item, dict) and 'content' in item:
+                        context_parts.append(f"Context {i+1}:\n{item['content']}")
+                    else:
+                        logger.warning(f"Invalid context item at index {i}: {item}")
+                        
+                formatted_context = "\n\n".join(context_parts)
+            else:
+                formatted_context = "No context available."
             
-            # Print concise source information
-            print("\nSources detected:")
-            for source, details in sources.items():
-                if isinstance(details, set):  # PDF with pages
-                    pages = ", ".join(sorted(details))
-                    print(f"Document: {source} (pages: {pages})")
-                else:  # Code with file path
-                    print(f"Code file: {source}")
-        
-        return {
-            "answer": answer,
-            "context": context
-        }
+            #system_prompt = """You are an AI assistant answering questions based on the provided context.
+    #Answer the question based on the context provided. If the answer is not in the context, say "I don't have enough information to answer this question." Be concise and accurate."""
+            
+            #user_content = f"Context:\n{formatted_context}\n\nQuestion: {query}"
+            
+            prompt_template = """## AustLII AI Legal Research Assistant - System Instructions
+
+                You are a legal research assistant. Your task is to answer ONLY from the retrieved legal documents and references and citations provided below.
+
+                **Critical Constraints:**
+                - Do NOT use outside knowledge unless explicitly authorised.
+                - Do NOT reference legal principles, legislation, or cases not mentioned in the provided documents.
+                - Do NOT add missing details to citations or complete partial references.
+                - Do not make assumptions, guesses, or inferences beyond the text.
+                - Do NOT invent content.
+                - If you find yourself drawing on legal knowledge beyond the documents, stop and use the fallback response.
+
+                **If the answer is not in the provided documents, respond exactly with:**
+                - "I do not have enough information to address your query."
+
+                You must follow the Response Rules exactly.
+
+                ---
+
+                ## Query or Task
+                {query}
+
+                ---
+
+                ## Retrieved Documents
+                The following legal documents were retrieved from AustLII. These are your only sources. Refer to them as [#].
+
+                {formatted_context}
+
+
+                ---
+
+                ## Response Rules
+
+                Unless the user asks for 'explanation,' limit the response to a direct answer to the query and no need to output the explanation of each step below.
+
+                1. **Evidence-first approach**
+                - Identify and quote/paraphrase only relevant sections from the provided documents.
+                - Attribute every quote/paraphrase to [#].
+
+                2. **Summary step**
+                - Summarise the key points from the identified sections.
+                - Do not add interpretation beyond what is explicitly in the documents.
+
+                3. **Final answer construction**
+                - Write your final answer strictly from the summary in step 2.
+                - Every factual claim must be supported by a [#] citation.
+
+                4. **Response format**
+                - Unless the user asks for 'explanation,' limit the response to a direct answer to the query subject to length limits in Response Requirements.
+                - When asked for 'explanation,' provide a step-by-step breakdown.
+
+                5. **Response Requirements**
+                Length Limits:
+                - Simple factual queries: 1-2 sentences maximum
+                - Case summaries: 2-3 sentences maximum
+                - Multi-part questions: Up to 5 sentences maximum
+                - Complex analysis (explicit user request): Up to 8 sentences maximum
+                - Document comparisons: Up to 6 sentences maximum
+
+                When More Detail is Needed:
+                If user requires comprehensive information, respond with available details within limits, then add: "For additional analysis, please ask specific follow-up questions about [list 2-3 specific aspects mentioned in documents]."
+
+                Override Conditions:
+                Exceed sentence limits ONLY when:
+                - Documents contain extensive directly quoted relevant material on the exact query
+                - User explicitly requests "detailed analysis with all available information"
+                - Multiple documents provide substantial overlapping content on the same narrow topic
+
+                6. **Style and formatting**
+                - Use Australian English and formal legal language.
+                - First mention of a case → full case name and citation
+                - First mention of legislation → short title + jurisdiction
+
+                7. **If no answer is found**
+                - Reply: "I do not have enough information to address your query."
+                - Do not guess or infer.
+
+                ---
+
+                ## Self-check before final output
+                - Have I used ONLY the provided documents?
+                - Does every factual claim have a [#] citation?
+                - Have I avoided assumptions or external knowledge?
+                - Have I avoided referencing cases, legislation, or legal principles not mentioned in the documents?
+                - Have I avoided adding or completing citation/reference details not in the documents?
+                - Have I used Australian English and the required citation format?
+                """
+
+            prompt = PromptTemplate.from_template(prompt_template)
+            
+            logger.info("Generating response using OCI Generative AI")
+            logger.info(f"Query: {query}")
+            logger.info(f"Context size: {len(formatted_context)} characters")
+            logger.info(f"prompt: {prompt_template}")
+            
+            answer = None
+            
+            if self.use_stream:
+                print("Generating streaming response...")
+                chain = (
+                    prompt
+                    | self.genai_client
+                )
+                currtime = time.time()
+                response = chain.invoke({"query": query,"formatted_context": formatted_context})
+                logger.info(f"Response from LLM generated in {time.time() - currtime:.2f} seconds")
+                # For streaming, we need to collect the tokens
+                answer = ""
+                for chunk in response:
+                    content = chunk.content if hasattr(chunk, "content") else str(chunk)
+                    print(content, end="", flush=True)
+                    answer += content
+                print()  # Add newline after streaming completes
+            else:
+                # Non-streaming response - use direct LLM invocation
+                currtime = time.time()
+                formatted_prompt = prompt.format(query=query, formatted_context=formatted_context)
+                messages = [{"role": "user", "content": formatted_prompt}]
+                response = self.genai_client.invoke(messages)
+                answer = response.content if hasattr(response, 'content') else str(response)
+                logger.info(f"Response from LLM generated in {time.time() - currtime:.2f} seconds")
+
+            # Ensure answer is not None
+            if answer is None:
+                answer = "I apologize, but I was unable to generate a response. Please try again."
+
+            # Add sources to response if available
+            sources = {}
+            if context:
+                # Group sources by document
+                for item in context:
+                    try:
+                        # Ensure item is a dict with metadata
+                        if not isinstance(item, dict) or 'metadata' not in item:
+                            logger.warning(f"Invalid context item structure: {item}")
+                            continue
+                            
+                        metadata = item['metadata']
+                        if not isinstance(metadata, dict):
+                            logger.warning(f"Invalid metadata structure: {metadata}")
+                            continue
+                            
+                        source = metadata.get('source', 'Unknown')
+                        if source not in sources:
+                            sources[source] = set()
+                        
+                        # Add page number if available
+                        if 'page' in metadata:
+                            sources[source].add(str(metadata['page']))
+                        # Add file path if available for code
+                        if 'file_path' in metadata:
+                            sources[source] = metadata['file_path']
+                    except Exception as item_error:
+                        logger.warning(f"Error processing context item: {item_error}")
+                        continue
+                
+                # Print concise source information
+                print("\nSources detected:")
+                for source, details in sources.items():
+                    if isinstance(details, set):  # PDF with pages
+                        pages = ", ".join(sorted(details))
+                        print(f"Document: {source} (pages: {pages})")
+                    else:  # Code with file path
+                        print(f"Code file: {source}")
+            
+            return {
+                "answer": answer,
+                "context": context
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in _generate_response: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "answer": f"I apologize, but I encountered an error while generating a response: {str(e)}",
+                "context": context or []
+            }
 
     def _generate_general_response(self, query: str) -> Dict[str, Any]:
         """Generate a response using general knowledge when no context is available"""
-        user_content = f"Query: {query}\n\nAnswer:"
-        
-        currtime = time.time()
-        messages = [{"role": "user", "content": user_content}]
-        response = self.genai_client.invoke(messages)
-        answer = response.content if hasattr(response, 'content') else str(response)
-        logger.info(f"General response generated in {time.time() - currtime:.2f} seconds")
-        # Return a general response without context
-        
-        logger.info("No context available, using general knowledge response")    
-        return {
-            "answer": answer,
-            "context": []
-        }
+        try:
+            user_content = f"Query: {query}\n\nAnswer:"
+            
+            currtime = time.time()
+            messages = [{"role": "user", "content": user_content}]
+            response = self.genai_client.invoke(messages)
+            answer = response.content if hasattr(response, 'content') else str(response)
+            
+            # Ensure answer is not None
+            if answer is None:
+                answer = "I apologize, but I was unable to generate a response. Please try again."
+                
+            logger.info(f"General response generated in {time.time() - currtime:.2f} seconds")
+            # Return a general response without context
+            
+            logger.info("No context available, using general knowledge response")    
+            return {
+                "answer": answer,
+                "context": []
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in _generate_general_response: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "answer": f"I apologize, but I encountered an error while generating a response: {str(e)}",
+                "context": []
+            }
     
     def _limit_context(self, documents: List[Dict[str, Any]], max_tokens: int = None) -> List[Dict[str, Any]]:
         """Limit context to fit within a token budget"""
@@ -1423,21 +1520,41 @@ def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
             
             # Print concise list of sources
             for i, ctx in enumerate(response["context"]):
-                source = ctx["metadata"].get("source", "Unknown")
-                if "page_numbers" in ctx["metadata"]:
-                    pages = ctx["metadata"].get("page_numbers", [])
-                    print(f"[{i+1}] {source} (pages: {pages})")
-                else:
-                    file_path = ctx["metadata"].get("file_path", "Unknown")
-                    print(f"[{i+1}] {source} (file: {file_path})")
+                try:
+                    # Ensure ctx is a dict with metadata
+                    if not isinstance(ctx, dict) or 'metadata' not in ctx:
+                        logger.warning(f"Invalid context item structure at index {i}: {ctx}")
+                        continue
+                        
+                    metadata = ctx["metadata"]
+                    if not isinstance(metadata, dict):
+                        logger.warning(f"Invalid metadata structure at index {i}: {metadata}")
+                        continue
+                        
+                    source = metadata.get("source", "Unknown")
+                    if "page_numbers" in metadata:
+                        pages = metadata.get("page_numbers", [])
+                        print(f"[{i+1}] {source} (pages: {pages})")
+                    else:
+                        file_path = metadata.get("file_path", "Unknown")
+                        print(f"[{i+1}] {source} (file: {file_path})")
+                except Exception as ctx_error:
+                    logger.warning(f"Error processing context item {i}: {ctx_error}")
+                    print(f"[{i+1}] Invalid context item")
                 
         # Return the response dictionary
         return response
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
-        return {"error": str(e)}
-        logger.error(f"Error processing request: {str(e)}")
-        return {"error": str(e)}
+        import traceback
+        traceback.print_exc()
+        # Return a valid response structure even on error
+        error_message = f"I apologize, but I encountered an error while processing your request: {str(e)}"
+        return {
+            "answer": error_message,
+            "context": [],
+            "error": str(e)
+        }
 
 def main():
     parser = argparse.ArgumentParser(description="Query documents using OCI Generative AI")
