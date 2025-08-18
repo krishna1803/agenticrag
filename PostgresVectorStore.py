@@ -222,6 +222,65 @@ class PostgresVectorStore(VectorStore):
             traceback.print_exc()
             return []
 
+    def query_pdf_collection_with_predicate(self, query: str, predicate: str = "", predicate_values: Optional[Dict] = None, n_results: int = 10) -> List[Dict[str, Any]]:
+        """Query the PDF documents collection with predicate filtering"""
+        start_time = time.time()
+        print("🔍 [Postgres] Querying PDF Collection with Predicate")
+        logging.info(f"Starting PDF collection query with predicate for: '{query[:50]}...' with n_results={n_results}")
+        
+        try:
+            # Use similarity search with predicate filtering
+            formatted_results = self.similarity_search(query, k=n_results, predicate=predicate, predicate_values=predicate_values)
+            
+            duration = time.time() - start_time
+            
+            if not formatted_results:
+                logging.warning(f"No results found for query with predicate in {duration:.2f}s")
+                print("No results found for the query with predicate.")
+                return []
+                
+            logging.info(f"🔍 [Postgres] Retrieved {len(formatted_results)} chunks from PDF Collection with predicate in {duration:.2f}s")
+            print(f"🔍 [Postgres] Retrieved {len(formatted_results)} chunks from PDF Collection with predicate in {duration:.2f}s")
+            return formatted_results
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            logging.error(f"Error in query_pdf_collection_with_predicate after {duration:.2f}s: {str(e)}")
+            print(f"Error in query_pdf_collection_with_predicate: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    def query_pdf_collection_with_predicate(self, query: str, n_results: int = 10, predicate: str = "", predicate_values: Dict = None) -> List[Dict[str, Any]]:
+        """Query the PDF documents collection with optional predicate filtering"""
+        start_time = time.time()
+        print("🔍 [Postgres] Querying PDF Collection with predicate filtering")
+        logging.info(f"Starting PDF collection query with predicate for: '{query[:50]}...' with n_results={n_results}")
+        
+        try:
+            # Use predicate-aware similarity search
+            formatted_results = self.similarity_search(query, k=n_results, predicate=predicate, predicate_values=predicate_values)
+            
+            duration = time.time() - start_time
+            
+            if not formatted_results:
+                logging.warning(f"No results found for query with predicate in {duration:.2f}s")
+                print("No results found for the query with predicate.")
+                return []
+                
+            logging.info(f"🔍 [Postgres] Retrieved {len(formatted_results)} chunks with predicate filtering in {duration:.2f}s")
+            print(f"🔍 [Postgres] Retrieved {len(formatted_results)} chunks with predicate filtering in {duration:.2f}s")
+            return formatted_results
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            logging.error(f"Error in query_pdf_collection_with_predicate after {duration:.2f}s: {str(e)}")
+            print(f"Error in query_pdf_collection_with_predicate: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to regular query without predicate
+            return self.query_pdf_collection(query, n_results)
+
     def query_general_collection(self, query: str, n_results: int = 3) -> List[Dict[str, Any]]:
         results = self.vectorstore.similarity_search(query, k=n_results)
         return self._convert_documents_to_dict(results)
@@ -247,26 +306,118 @@ class PostgresVectorStore(VectorStore):
     # similarity_search
     #
     def similarity_search(
-        self, query: str, k: int = 10
+        self, query: str, k: int = 10, predicate: str = "", predicate_values: Optional[Dict] = None
     ) -> List[Dict[str, Any]]:
-        """Return docs most similar to query."""
+        """Return docs most similar to query with optional predicate filtering.
+        
+        Args:
+            query: The search query
+            k: Number of results to return
+            predicate: Optional SQL predicate for filtering (without WHERE clause)
+            predicate_values: Optional values for predicate parameters
+        """
         logging.info(f"Similarity Search for Postgres Vector Store")
 
         try:
-            # First try using the built-in PGVector search which is more efficient
-            documents = self.vectorstore.similarity_search(query, k=k)
+            # Use built-in PGVector search if no predicate is provided
+            if not predicate:
+                documents = self.vectorstore.similarity_search(query, k=k)
+                
+                if documents:
+                    logging.info(f"🔍 [PostgresDB] Retrieved {len(documents)} chunks using PGVector search")
+                    return self._convert_documents_to_dict(documents)
             
-            if documents:
-                logging.info(f"🔍 [PostgresDB] Retrieved {len(documents)} chunks using PGVector search")
-                return self._convert_documents_to_dict(documents)
-            
-            # Fallback to custom search if needed
-            logging.info("No results from PGVector search, trying custom search...")
-            return self._custom_similarity_search(query, k)
+            # Use custom search with predicate filtering
+            logging.info("Using custom similarity search with predicate filtering...")
+            return self._custom_similarity_search_with_predicate(query, k, predicate, predicate_values or {})
             
         except Exception as e:
             logging.error(f"Error in similarity_search: {str(e)}")
-            # Fallback to custom search
+            # Fallback to custom search without predicate
+            return self._custom_similarity_search(query, k)
+    
+    def _custom_similarity_search_with_predicate(self, query: str, k: int = 10, predicate: str = "", predicate_values: Dict = None) -> List[Dict[str, Any]]:
+        """Custom similarity search implementation with predicate filtering"""
+        logging.info(f"Using custom similarity search with predicate for Postgres Vector Store")
+
+        # Get the embedding for the query using the same model that created the embeddings
+        query_embedding = self._embedding_function.embed_query(query)
+        
+        # Format the embedding vector as a PostgreSQL vector literal
+        embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+        embedding_dim = len(query_embedding)  # Get actual dimension
+
+        formatted_results = []
+        
+        if predicate_values is None:
+            predicate_values = {}
+
+        try:
+            with self.engine.begin() as conn:
+                
+                print(f"Using embedding vector: {embedding_str[:50]}...")
+                print(f"Using predicate: {predicate}")
+                
+                # Build the WHERE clause if predicate is provided
+                where_clause = ""
+                if predicate:
+                    where_clause = f" WHERE {predicate}"
+                
+                # Use the working SQL query structure with optional predicate
+                search_query = f"""SELECT a.source, a.content, b.doc_id, b.chunk_metadata, b.vector <=> '{embedding_str}'::vector({embedding_dim}) AS distance
+                                FROM documents a JOIN embeddings b ON a.id = b.doc_id{where_clause}
+                                ORDER BY distance
+                                LIMIT {k}; """
+
+                print(f"Executing search query with predicate...")
+                result = conn.execute(text(search_query), predicate_values)
+                rows = result.fetchall()
+        
+                # Format results
+                formatted_results = []
+                for row in rows:
+                    source = row[0]
+                    content = row[1]
+                    doc_id = row[2]
+                    chunk_metadata = row[3]
+                    distance = row[4]
+                    
+                    # Process metadata - either parse JSON or use as is
+                    if isinstance(chunk_metadata, str):
+                        try:
+                            base_metadata = json.loads(chunk_metadata)
+                        except json.JSONDecodeError:
+                            base_metadata = {"raw_metadata": chunk_metadata}
+                    elif chunk_metadata is None:
+                        base_metadata = {}
+                    else:
+                        base_metadata = chunk_metadata
+                    
+                    # Add source and doc_id to metadata
+                    enhanced_metadata = {
+                        **base_metadata,
+                        "source": source,
+                        "page_numbers": doc_id,
+                        "similarity_score": float(distance)
+                    }
+                    
+                    # Create the formatted result
+                    result_item = {
+                        "content": content,
+                        "metadata": enhanced_metadata
+                    }
+
+                    print(f"Document from: {source}, Page Numbers: {doc_id}, Score: {distance}")
+                    formatted_results.append(result_item)
+                
+                print(f"🔍 [PostgresDB] Retrieved {len(formatted_results)} chunks with predicate filtering")
+                return formatted_results    
+    
+        except Exception as e:
+            print(f"Error performing custom similarity search with predicate: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to search without predicate
             return self._custom_similarity_search(query, k)
     
     def _custom_similarity_search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:

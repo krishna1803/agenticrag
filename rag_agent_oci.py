@@ -33,6 +33,7 @@ from langchain_core.prompts import PromptTemplate
 
 # Local imports
 from agents.agent_factory import create_agents
+from search_filter_extractor import SearchFilterExtractor
 try:
     from OracleDBVectorStore import OracleDBVectorStore
     ORACLE_DB_AVAILABLE = True
@@ -266,6 +267,9 @@ class OCIRAGAgent:
             self.batch_processor = LLMBatchProcessor(self.genai_client, self.batch_config)
         else:
             self.batch_processor = None
+        
+        # Initialize search filter extractor for predicate-based similarity search
+        self.search_filter_extractor = SearchFilterExtractor()
     
     @classmethod
     def warm_cache(cls, model_id: str, compartment_id: str, vector_store_types: List[str] = None):
@@ -355,43 +359,48 @@ class OCIRAGAgent:
         # Get initial context based on selected collection
         initial_context = []
         try:
-            # Fetch context (collection-specific code remains the same)
-            if self.collection == "PDF Collection":
-                logger.info(f"Retrieving context from PDF Collection for query: '{query}'")
-                pdf_context = self.vector_store.query_pdf_collection(query)
-                initial_context.extend(pdf_context)
-                logger.info(f"Retrieved {len(pdf_context)} chunks from PDF Collection")
-                # Log each chunk with citation number but not full content
-                for i, chunk in enumerate(pdf_context):
-                    source = chunk["metadata"].get("source", "Unknown")
-                    pages = chunk["metadata"].get("page_numbers", [])
-                    logger.info(f"Source [{i+1}]: {source} (pages: {pages})")
-                    content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
-                    logger.info(f"Content preview for source [{i+1}]: {content_preview}")
-            elif self.collection == "Repository Collection":
-                logger.info(f"Retrieving context from Repository Collection for query: '{query}'")
-                repo_context = self.vector_store.query_repo_collection(query)
-                initial_context.extend(repo_context)
-                logger.info(f"Retrieved {len(repo_context)} chunks from Repository Collection")
-                for i, chunk in enumerate(repo_context):
-                    source = chunk["metadata"].get("source", "Unknown")
-                    file_path = chunk["metadata"].get("file_path", "Unknown")
-                    logger.info(f"Source [{i+1}]: {source} (file: {file_path})")
-                    content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
-                    logger.info(f"Content preview for source [{i+1}]: {content_preview}")
-            elif self.collection == "Web Knowledge Base":
-                logger.info(f"Retrieving context from Web Knowledge Base for query: '{query}'")
-                web_context = self.vector_store.query_web_collection(query)
-                initial_context.extend(web_context)
-                logger.info(f"Retrieved {len(web_context)} chunks from Web Knowledge Base")
-                for i, chunk in enumerate(web_context):
-                    source = chunk["metadata"].get("source", "Unknown")
-                    title = chunk["metadata"].get("title", "Unknown")
-                    logger.info(f"Source [{i+1}]: {source} (title: {title})")
-                    content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
-                    logger.info(f"Content preview for source [{i+1}]: {content_preview}")
-            else:
-                logger.info("Using General Knowledge collection, no context retrieval needed")
+            # Use predicate-based context retrieval
+            logger.info(f"Retrieving context from {self.collection} for query: '{query}'")
+            context_chunks = self._get_context_with_predicate_filtering(query, self.collection)
+            initial_context.extend(context_chunks)
+            logger.info(f"Retrieved {len(context_chunks)} chunks from {self.collection}")
+            
+            # Log each chunk with citation number but not full content
+            for i, chunk in enumerate(context_chunks):
+                source = chunk["metadata"].get("source", "Unknown")
+                pages = chunk["metadata"].get("page_numbers", [])
+                logger.info(f"Source [{i+1}]: {source} (pages: {pages})")
+                content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
+                logger.info(f"Content preview for source [{i+1}]: {content_preview}")
+                
+        except Exception as e:
+            logger.error(f"Error retrieving context: {str(e)}")
+            # Fallback to standard retrieval if predicate-based fails
+                
+        except Exception as e:
+            logger.error(f"Error retrieving context: {str(e)}")
+            # Fallback to standard retrieval if predicate-based fails
+            try:
+                if self.collection == "PDF Collection":
+                    logger.info(f"Fallback: Retrieving context from PDF Collection for query: '{query}'")
+                    pdf_context = self.vector_store.query_pdf_collection(query)
+                    initial_context.extend(pdf_context)
+                    logger.info(f"Retrieved {len(pdf_context)} chunks from PDF Collection")
+                elif self.collection == "Repository Collection":
+                    logger.info(f"Fallback: Retrieving context from Repository Collection for query: '{query}'")
+                    repo_context = self.vector_store.query_repo_collection(query)
+                    initial_context.extend(repo_context)
+                    logger.info(f"Retrieved {len(repo_context)} chunks from Repository Collection")
+                elif self.collection == "Web Knowledge Base":
+                    logger.info(f"Fallback: Retrieving context from Web Knowledge Base for query: '{query}'")
+                    web_context = self.vector_store.query_web_collection(query)
+                    initial_context.extend(web_context)
+                    logger.info(f"Retrieved {len(web_context)} chunks from Web Knowledge Base")
+                else:
+                    logger.info("Using General Knowledge collection, no context retrieval needed")
+            except Exception as fallback_error:
+                logger.error(f"Error in fallback context retrieval: {str(fallback_error)}")
+                initial_context = []
             
             # Apply token budget to context
             initial_context = self._limit_context(initial_context, max_tokens=40000)
@@ -605,37 +614,37 @@ class OCIRAGAgent:
         # Initialize context variables
         context = []
         
-        # Get context based on selected collection
-        if self.collection == "PDF Collection":
-            logger.info(f"Retrieving context from PDF Collection for query: '{query}'")
-            context = self.vector_store.query_pdf_collection(query)
-            logger.info(f"Retrieved {len(context)} chunks from PDF Collection")
+        # Get context based on selected collection using predicate-based retrieval
+        try:
+            logger.info(f"Retrieving context from {self.collection} for query: '{query}'")
+            context = self._get_context_with_predicate_filtering(query, self.collection)
+            logger.info(f"Retrieved {len(context)} chunks from {self.collection}")
+            
             for i, chunk in enumerate(context):
                 source = chunk["metadata"].get("source", "Unknown")
                 pages = chunk["metadata"].get("page_numbers", [])
                 logger.info(f"Source [{i+1}]: {source} (pages: {pages})")
                 content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
                 logger.debug(f"Content preview for source [{i+1}]: {content_preview}")
-        elif self.collection == "Repository Collection":
-            logger.info(f"Retrieving context from Repository Collection for query: '{query}'")
-            context = self.vector_store.query_repo_collection(query)
-            logger.info(f"Retrieved {len(context)} chunks from Repository Collection")
-            for i, chunk in enumerate(context):
-                source = chunk["metadata"].get("source", "Unknown")
-                file_path = chunk["metadata"].get("file_path", "Unknown")
-                logger.info(f"Source [{i+1}]: {source} (file: {file_path})")
-                content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
-                logger.debug(f"Content preview for source [{i+1}]: {content_preview}")
-        elif self.collection == "Web Knowledge Base":
-            logger.info(f"Retrieving context from Web Knowledge Base for query: '{query}'")
-            context = self.vector_store.query_web_collection(query)
-            logger.info(f"Retrieved {len(context)} chunks from Web Knowledge Base")
-            for i, chunk in enumerate(context):
-                source = chunk["metadata"].get("source", "Unknown")
-                title = chunk["metadata"].get("title", "Unknown")
-                logger.info(f"Source [{i+1}]: {source} (title: {title})")
-                content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
-                logger.debug(f"Content preview for source [{i+1}]: {content_preview}")
+                
+        except Exception as e:
+            logger.error(f"Error retrieving context with predicate: {str(e)}")
+            # Fallback to standard context retrieval
+            try:
+                if self.collection == "PDF Collection":
+                    logger.info(f"Fallback: Retrieving context from PDF Collection for query: '{query}'")
+                    context = self.vector_store.query_pdf_collection(query)
+                elif self.collection == "Repository Collection":
+                    logger.info(f"Fallback: Retrieving context from Repository Collection for query: '{query}'")
+                    context = self.vector_store.query_repo_collection(query)
+                elif self.collection == "Web Knowledge Base":
+                    logger.info(f"Fallback: Retrieving context from Web Knowledge Base for query: '{query}'")
+                    context = self.vector_store.query_web_collection(query)
+                    
+                logger.info(f"Retrieved {len(context)} chunks from {self.collection} (fallback)")
+            except Exception as fallback_error:
+                logger.error(f"Error in fallback context retrieval: {str(fallback_error)}")
+                context = []
         
         # Generate response using context if available, otherwise use general knowledge
         if context:
@@ -1138,6 +1147,58 @@ Answer:"""
             logger.error(f"Error in batch synthesis optimization: {str(e)}")
             # Fall back to agent-based synthesis
             return self.agents["synthesizer"].synthesize(query, reasoning_steps)
+
+    def _get_context_with_predicate_filtering(self, query: str, collection: str) -> List[Dict[str, Any]]:
+        """Get context with optional predicate filtering for enhanced search precision"""
+        try:
+            # Extract predicate from query if available
+            predicate, predicate_values = self.search_filter_extractor.extract_predicate_from_query(query)
+            
+            logger.info(f"Extracted predicate: '{predicate}' with values: {predicate_values}")
+            
+            if collection == "PDF Collection":
+                # Check if vector store supports predicate-based querying
+                if hasattr(self.vector_store, 'query_pdf_collection_with_predicate') and predicate:
+                    logger.info(f"Using predicate-based search for PDF Collection")
+                    return self.vector_store.query_pdf_collection_with_predicate(
+                        query, 
+                        n_results=self.max_results,
+                        predicate=predicate,
+                        predicate_values=predicate_values
+                    )
+                else:
+                    logger.info(f"Using standard search for PDF Collection (no predicate or not supported)")
+                    return self.vector_store.query_pdf_collection(query, n_results=self.max_results)
+                    
+            elif collection == "Repository Collection":
+                # Currently no predicate support for repo collection, use standard search
+                return self.vector_store.query_repo_collection(query, n_results=self.max_results)
+                
+            elif collection == "Web Collection":
+                # Currently no predicate support for web collection, use standard search
+                return self.vector_store.query_web_collection(query, n_results=self.max_results)
+                
+            elif collection == "General Collection":
+                # Currently no predicate support for general collection, use standard search
+                return self.vector_store.query_general_collection(query, n_results=self.max_results)
+                
+            else:
+                logger.warning(f"Unknown collection: {collection}, using PDF Collection as default")
+                return self.vector_store.query_pdf_collection(query, n_results=self.max_results)
+                
+        except Exception as e:
+            logger.error(f"Error in predicate-based context retrieval: {str(e)}")
+            # Fallback to standard search
+            if collection == "PDF Collection":
+                return self.vector_store.query_pdf_collection(query, n_results=self.max_results)
+            elif collection == "Repository Collection":
+                return self.vector_store.query_repo_collection(query, n_results=self.max_results)
+            elif collection == "Web Collection":
+                return self.vector_store.query_web_collection(query, n_results=self.max_results)
+            elif collection == "General Collection":
+                return self.vector_store.query_general_collection(query, n_results=self.max_results)
+            else:
+                return []
 
 def load_config() -> Dict[str, Any]:
         """Load configuration from config_oci.yaml with default values"""
