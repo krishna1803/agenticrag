@@ -56,17 +56,26 @@ _agent_cache = {}
 class LLMBatchProcessor:
     """Handles batch processing of LLM requests for improved performance"""
     
-    def __init__(self, llm):
+    def __init__(self, llm, batch_config: Dict[str, Any] = None):
         self.llm = llm
         self.logger = logging.getLogger(__name__)
+        
+        # Set batch processing configuration
+        self.batch_config = batch_config or {}
+        self.max_concurrent = self.batch_config.get("MAX_CONCURRENT", 3)
+        self.request_timeout = self.batch_config.get("REQUEST_TIMEOUT", 60)
+        self.batch_timeout = self.batch_config.get("BATCH_TIMEOUT", 120)
+        
+        self.logger.info(f"Batch processor initialized with max_concurrent={self.max_concurrent}, "
+                        f"request_timeout={self.request_timeout}s, batch_timeout={self.batch_timeout}s")
     
-    def batch_process_requests(self, requests: List[Dict[str, Any]], max_concurrent: int = 3) -> List[str]:
+    def batch_process_requests(self, requests: List[Dict[str, Any]], max_concurrent: int = None) -> List[str]:
         """
         Process multiple LLM requests in batches to reduce latency
         
         Args:
             requests: List of dicts with 'messages' and 'type' keys
-            max_concurrent: Maximum number of concurrent requests
+            max_concurrent: Maximum number of concurrent requests (overrides config if provided)
             
         Returns:
             List of response strings in the same order as requests
@@ -74,28 +83,39 @@ class LLMBatchProcessor:
         if not requests:
             return []
         
-        self.logger.info(f"Processing {len(requests)} LLM requests in batch")
+        # Use provided max_concurrent or fall back to config
+        max_workers = max_concurrent or self.max_concurrent
+        
+        self.logger.info(f"Processing {len(requests)} LLM requests in batch with {max_workers} workers")
         start_time = time.time()
         
         # For now, we'll use ThreadPoolExecutor for concurrent processing
         # In the future, this could be enhanced with actual batch API calls
-        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_index = {}
             
             for i, request in enumerate(requests):
                 future = executor.submit(self._process_single_request, request)
                 future_to_index[future] = i
             
-            # Collect results in order
+            # Collect results in order with timeout
             results = [None] * len(requests)
             from concurrent.futures import as_completed
-            for future in as_completed(future_to_index):
-                index = future_to_index[future]
-                try:
-                    results[index] = future.result()
-                except Exception as e:
-                    self.logger.error(f"Error processing request {index}: {str(e)}")
-                    results[index] = f"Error processing request: {str(e)}"
+            
+            try:
+                for future in as_completed(future_to_index, timeout=self.batch_timeout):
+                    index = future_to_index[future]
+                    try:
+                        results[index] = future.result(timeout=self.request_timeout)
+                    except Exception as e:
+                        self.logger.error(f"Error processing request {index}: {str(e)}")
+                        results[index] = f"Error processing request: {str(e)}"
+            except Exception as e:
+                self.logger.error(f"Batch processing timeout or error: {str(e)}")
+                # Fill any remaining None results with error messages
+                for i, result in enumerate(results):
+                    if result is None:
+                        results[i] = f"Request {i} timed out or failed"
         
         duration = time.time() - start_time
         self.logger.info(f"Batch processing completed in {duration:.2f} seconds")
@@ -185,9 +205,8 @@ def load_oci_config():
 
 class OCIRAGAgent:
     def __init__(self, vector_store: OracleDBVectorStore, use_cot: bool = False, collection: str = None, skip_analysis: bool = False,
-                 model_id: str = "cohere.command-latest", compartment_id: str = None, use_stream:bool = False,max_chunks_per_step: int = 2,
-                 max_findings_per_step: int = 3, 
-                 max_tokens_per_finding: int = 1000):
+                 model_id: str = "cohere.command-latest", compartment_id: str = None, use_stream: bool = False,
+                 config: Dict[str, Any] = None):
         """Initialize RAG agent with vector store and OCI Generative AI"""
         self.vector_store = vector_store
         if vector_store is OracleDBVectorStore:
@@ -199,9 +218,34 @@ class OCIRAGAgent:
         self.model_id = model_id
         self.compartment_id = compartment_id or os.getenv("OCI_COMPARTMENT_ID")
         self.use_stream = use_stream
-        self.max_chunks_per_step = max_chunks_per_step
-        self.max_findings_per_step = max_findings_per_step
-        self.max_tokens_per_finding = max_tokens_per_finding
+        
+        # Load configuration
+        self.config = config or load_config()
+        
+        # Set similarity search parameters from config
+        similarity_config = self.config.get("SIMILARITY_SEARCH", {})
+        self.max_results = similarity_config.get("MAX_RESULTS", 3)
+        self.max_chunks_per_step = similarity_config.get("MAX_CHUNKS_PER_STEP", 2)
+        self.max_findings_per_step = similarity_config.get("MAX_FINDINGS_PER_STEP", 3)
+        self.max_tokens_per_finding = similarity_config.get("MAX_TOKENS_PER_FINDING", 1000)
+        
+        # Set performance parameters from config
+        performance_config = self.config.get("PERFORMANCE", {})
+        self.batch_config = performance_config.get("BATCH_PROCESSING", {})
+        self.cache_config = performance_config.get("CACHING", {})
+        self.parallel_config = performance_config.get("PARALLEL_PROCESSING", {})
+        self.context_config = performance_config.get("CONTEXT", {})
+        
+        # Set response quality parameters from config
+        quality_config = self.config.get("RESPONSE_QUALITY", {})
+        self.max_plan_steps = quality_config.get("MAX_PLAN_STEPS", 3)
+        self.remove_latex = quality_config.get("REMOVE_LATEX_FORMATTING", True)
+        self.enable_validation = quality_config.get("ENABLE_VALIDATION", True)
+        self.fallback_on_error = quality_config.get("FALLBACK_ON_ERROR", True)
+        
+        logger.info(f"RAG Agent initialized with config: max_results={self.max_results}, "
+                   f"max_chunks_per_step={self.max_chunks_per_step}, "
+                   f"max_findings_per_step={self.max_findings_per_step}")
 
         # Priority 3: Use cached LLM and agent initialization
         vector_store_id = str(hash(str(vector_store))) if vector_store else "none"
@@ -218,7 +262,10 @@ class OCIRAGAgent:
             self.agents = None
         
         # Priority 2: Initialize batch processor for LLM operations
-        self.batch_processor = LLMBatchProcessor(self.genai_client)
+        if self.batch_config.get("ENABLED", True):
+            self.batch_processor = LLMBatchProcessor(self.genai_client, self.batch_config)
+        else:
+            self.batch_processor = None
     
     @classmethod
     def warm_cache(cls, model_id: str, compartment_id: str, vector_store_types: List[str] = None):
@@ -368,23 +415,31 @@ class OCIRAGAgent:
             research_start_time = time.time()
             
             plan_steps = [step for step in plan.split("\n") if step.strip()]
-            if len(plan_steps) > 3:
-                logger.info(f"Limiting plan from {len(plan_steps)} steps to 3 steps")
-                plan_steps = plan_steps[:3]
+            if len(plan_steps) > self.max_plan_steps:
+                logger.info(f"Limiting plan from {len(plan_steps)} steps to {self.max_plan_steps} steps (configurable)")
+                plan_steps = plan_steps[:self.max_plan_steps]
 
             # Use improved parallel processing with ThreadPoolExecutor
             try:
-                logger.info("Attempting parallel research execution with ThreadPoolExecutor")
-                research_results = self._research_steps_parallel_fixed(query, plan_steps)
+                if self.parallel_config.get("ENABLED", True) and self.parallel_config.get("USE_THREAD_POOL", True):
+                    logger.info("Attempting parallel research execution with ThreadPoolExecutor")
+                    research_results = self._research_steps_parallel_fixed(query, plan_steps)
+                else:
+                    logger.info("Parallel processing disabled, using sequential research")
+                    research_results = self._research_steps_sequential(query, plan_steps)
+                    
                 research_duration = time.time() - research_start_time
-                logger.info(f"Parallel research completed for {len(research_results)} steps in {research_duration:.2f} seconds")
+                logger.info(f"Research completed for {len(research_results)} steps in {research_duration:.2f} seconds")
             
             except Exception as e:
-                logger.error(f"Error in parallel research: {str(e)}")
-                logger.info("Falling back to sequential research")
-                research_results = self._research_steps_sequential(query, plan_steps)
-                research_duration = time.time() - research_start_time
-                logger.info(f"Sequential research completed in {research_duration:.2f} seconds")
+                logger.error(f"Error in research: {str(e)}")
+                if self.fallback_on_error:
+                    logger.info("Falling back to sequential research")
+                    research_results = self._research_steps_sequential(query, plan_steps)
+                    research_duration = time.time() - research_start_time
+                    logger.info(f"Sequential research completed in {research_duration:.2f} seconds")
+                else:
+                    raise e
             
             # Step 3: Batch reasoning for better efficiency
             logger.info("Step 3: Reasoning (batch processing)")
@@ -392,50 +447,70 @@ class OCIRAGAgent:
             
             # Try batch reasoning first for better performance
             try:
-                logger.info("Attempting batch reasoning processing")
-                batch_start_time = time.time()
-                
-                # Use the batch processor for reasoning
-                batch_reasoning_results = self.batch_processor.batch_reasoning_requests(query, research_results)
-                
-                # Convert batch results to reasoning steps
-                for i, result in enumerate(batch_reasoning_results):
-                    if result and not result.startswith("Error"):
-                        reasoning_steps.append(result)
-                    else:
-                        logger.warning(f"Batch reasoning failed for step {i+1}, using fallback")
-                        # Fall back to individual reasoning for this step
-                        research_result = research_results[i] if i < len(research_results) else None
-                        if research_result and self.agents.get("reasoner") and research_result.get("findings"):
-                            findings = research_result["findings"] or [{"content": "No specific information found.", 
-                                                                   "metadata": {"source": "General Knowledge"}}]
-                            if findings:
-                                step_reasoning = self.agents["reasoner"].reason(query, research_result["step"], findings)
-                                reasoning_steps.append(step_reasoning)
+                if self.batch_processor and self.batch_config.get("ENABLED", True):
+                    logger.info("Attempting batch reasoning processing")
+                    batch_start_time = time.time()
+                    
+                    # Use the batch processor for reasoning
+                    batch_reasoning_results = self.batch_processor.batch_reasoning_requests(query, research_results)
+                    
+                    # Convert batch results to reasoning steps
+                    for i, result in enumerate(batch_reasoning_results):
+                        if result and not result.startswith("Error"):
+                            reasoning_steps.append(result)
                         else:
-                            reasoning_steps.append(f"For {research_result['step'] if research_result else 'unknown step'}, insufficient information was found.")
-                
-                batch_duration = time.time() - batch_start_time
-                logger.info(f"Batch reasoning completed in {batch_duration:.2f} seconds for {len(reasoning_steps)} steps")
+                            logger.warning(f"Batch reasoning failed for step {i+1}, using fallback")
+                            # Fall back to individual reasoning for this step
+                            research_result = research_results[i] if i < len(research_results) else None
+                            if research_result and self.agents.get("reasoner") and research_result.get("findings"):
+                                findings = research_result["findings"] or [{"content": "No specific information found.", 
+                                                                       "metadata": {"source": "General Knowledge"}}]
+                                if findings:
+                                    step_reasoning = self.agents["reasoner"].reason(query, research_result["step"], findings)
+                                    reasoning_steps.append(step_reasoning)
+                            else:
+                                reasoning_steps.append(f"For {research_result['step'] if research_result else 'unknown step'}, insufficient information was found.")
+                    
+                    batch_duration = time.time() - batch_start_time
+                    logger.info(f"Batch reasoning completed in {batch_duration:.2f} seconds for {len(reasoning_steps)} steps")
+                else:
+                    logger.info("Batch processing disabled, using sequential reasoning")
+                    # Use sequential reasoning
+                    for result in research_results:
+                        try:
+                            if self.agents.get("reasoner") and result.get("findings"):
+                                findings = result["findings"] or [{"content": "No specific information found.", 
+                                                               "metadata": {"source": "General Knowledge"}}]
+                                # Only process if we have findings
+                                if findings:
+                                    step_reasoning = self.agents["reasoner"].reason(query, result["step"], findings)
+                                    reasoning_steps.append(step_reasoning)
+                        except Exception as e:
+                            logger.error(f"Error reasoning about step '{result['step']}': {str(e)}")
+                            # Add a fallback reasoning if the step fails
+                            reasoning_steps.append(f"For {result['step']}, insufficient information was found.")
                 
             except Exception as e:
-                logger.error(f"Error in batch reasoning: {str(e)}")
-                logger.info("Falling back to sequential reasoning")
-                
-                # Fall back to sequential reasoning if batch fails
-                for result in research_results:
-                    try:
-                        if self.agents.get("reasoner") and result.get("findings"):  # Check if findings exist
-                            findings = result["findings"] or [{"content": "No specific information found.", 
-                                                           "metadata": {"source": "General Knowledge"}}]
-                            # Only process if we have findings
-                            if findings:
-                                step_reasoning = self.agents["reasoner"].reason(query, result["step"], findings)
-                                reasoning_steps.append(step_reasoning)
-                    except Exception as e:
-                        logger.error(f"Error reasoning about step '{result['step']}': {str(e)}")
-                        # Add a fallback reasoning if the step fails
-                        reasoning_steps.append(f"For {result['step']}, insufficient information was found.")
+                logger.error(f"Error in reasoning: {str(e)}")
+                if self.fallback_on_error:
+                    logger.info("Falling back to sequential reasoning")
+                    
+                    # Fall back to sequential reasoning if batch fails
+                    for result in research_results:
+                        try:
+                            if self.agents.get("reasoner") and result.get("findings"):  # Check if findings exist
+                                findings = result["findings"] or [{"content": "No specific information found.", 
+                                                               "metadata": {"source": "General Knowledge"}}]
+                                # Only process if we have findings
+                                if findings:
+                                    step_reasoning = self.agents["reasoner"].reason(query, result["step"], findings)
+                                    reasoning_steps.append(step_reasoning)
+                        except Exception as e:
+                            logger.error(f"Error reasoning about step '{result['step']}': {str(e)}")
+                            # Add a fallback reasoning if the step fails
+                            reasoning_steps.append(f"For {result['step']}, insufficient information was found.")
+                else:
+                    raise e
 
             # Check if we have any reasoning steps before synthesis
             if not reasoning_steps:
@@ -751,16 +826,25 @@ class OCIRAGAgent:
             "context": []
         }
     
-    def _limit_context(self, documents: List[Dict[str, Any]], max_tokens: int = 12000) -> List[Dict[str, Any]]:
+    def _limit_context(self, documents: List[Dict[str, Any]], max_tokens: int = None) -> List[Dict[str, Any]]:
         """Limit context to fit within a token budget"""
         if not documents:
             return []
         
+        # Use provided max_tokens or fall back to config
+        if max_tokens is None:
+            max_tokens = self.context_config.get("MAX_TOKENS", 12000)
+        
+        # Check if auto-limiting is enabled
+        if not self.context_config.get("AUTO_LIMIT_CONTEXT", True):
+            logger.info("Context auto-limiting disabled, returning all documents")
+            return documents
+        
         limited_docs = []
         token_count = 0
         
-        # Simple token estimation (4 chars ≈ 1 token)
-        char_to_token_ratio = 4
+        # Use configured character to token ratio
+        char_to_token_ratio = self.context_config.get("CHAR_TO_TOKEN_RATIO", 4)
         
         for doc in documents:
             # Estimate tokens in this document
@@ -775,13 +859,13 @@ class OCIRAGAgent:
                     truncated_doc = doc.copy()
                     truncated_doc["content"] = truncated_content
                     limited_docs.append(truncated_doc)
-                    logger.info(f"Truncated document to fit token budget")
+                    logger.info(f"Truncated document to fit token budget ({max_tokens} tokens)")
                 break
             
             limited_docs.append(doc)
             token_count += doc_tokens
         
-        logger.info(f"Limited context from {len(documents)} to {len(limited_docs)} documents (~{token_count} tokens)")
+        logger.info(f"Limited context from {len(documents)} to {len(limited_docs)} documents (~{token_count} tokens, max: {max_tokens})")
         return limited_docs
 
     async def _research_steps_parallel(self, query: str, plan_steps: List[str]) -> List[Dict[str, Any]]:
@@ -923,8 +1007,8 @@ Provide your analysis for each step separately:
         logger.info(f"Starting parallel research for {len(plan_steps)} steps")
         start_time = time.time()
         
-        # Use ThreadPoolExecutor for true parallel processing
-        max_workers = min(len(plan_steps), 3)  # Limit to 3 concurrent workers
+        # Use configured max workers
+        max_workers = min(len(plan_steps), self.parallel_config.get("MAX_WORKERS", 3))
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all research tasks
@@ -943,12 +1027,16 @@ Provide your analysis for each step separately:
             research_results = []
             completed_count = 0
             
-            for future in concurrent.futures.as_completed(future_to_step, timeout=120):
+            # Use configured timeout
+            batch_timeout = self.batch_config.get("BATCH_TIMEOUT", 120)
+            request_timeout = self.batch_config.get("REQUEST_TIMEOUT", 60)
+            
+            for future in concurrent.futures.as_completed(future_to_step, timeout=batch_timeout):
                 step = future_to_step[future]
                 completed_count += 1
                 
                 try:
-                    findings = future.result(timeout=60)  # 60 second timeout per step
+                    findings = future.result(timeout=request_timeout)
                     research_results.append({"step": step, "findings": findings})
                     
                     findings_count = len(findings) if isinstance(findings, list) else 0
@@ -963,7 +1051,7 @@ Provide your analysis for each step separately:
             research_results.sort(key=lambda x: step_order.get(x["step"], 999))
         
         duration = time.time() - start_time
-        logger.info(f"Parallel research completed in {duration:.2f} seconds for {len(research_results)} steps")
+        logger.info(f"Parallel research completed in {duration:.2f} seconds for {len(research_results)} steps with {max_workers} workers")
         
         return research_results
     
@@ -972,12 +1060,13 @@ Provide your analysis for each step separately:
         try:
             logger.info(f"Researching step: {step}")
             
-            # Call the researcher agent's research method
+            # Call the researcher agent's research method with configurable max_results
             findings = self.agents["researcher"].research(
                 query, step, 
                 max_chunks,
                 max_findings,
-                max_tokens
+                max_tokens,
+                max_results=self.max_results  # Pass configured max_results
             )
             
             # Ensure we return a list
@@ -1050,24 +1139,92 @@ Answer:"""
             # Fall back to agent-based synthesis
             return self.agents["synthesizer"].synthesize(query, reasoning_steps)
 
-def load_config() -> Dict[str, str]:
-        """Load configuration from config_oci.yaml"""
+def load_config() -> Dict[str, Any]:
+        """Load configuration from config_oci.yaml with default values"""
+        # Default configuration values
+        default_config = {
+            "OCI_COMPARTMENT_ID": "",
+            "OCI_MODEL_ID": "meta.llama-4-maverick-17b-128e-instruct-fp8",
+            "VECTOR_DB": "postgres",
+            "COLLECTION": "PDF Collection",
+            "USE_COT": False,
+            "SIMILARITY_SEARCH": {
+                "MAX_RESULTS": 3,
+                "MAX_CHUNKS_PER_STEP": 2,
+                "MAX_FINDINGS_PER_STEP": 3,
+                "MAX_TOKENS_PER_FINDING": 1000
+            },
+            "PERFORMANCE": {
+                "BATCH_PROCESSING": {
+                    "ENABLED": True,
+                    "MAX_CONCURRENT": 3,
+                    "REQUEST_TIMEOUT": 60,
+                    "BATCH_TIMEOUT": 120
+                },
+                "CACHING": {
+                    "ENABLED": True,
+                    "LLM_CACHE_SIZE": 10,
+                    "AGENT_CACHE_SIZE": 10,
+                    "WARM_CACHE_ON_STARTUP": True
+                },
+                "PARALLEL_PROCESSING": {
+                    "ENABLED": True,
+                    "MAX_WORKERS": 3,
+                    "USE_THREAD_POOL": True
+                },
+                "CONTEXT": {
+                    "MAX_TOKENS": 12000,
+                    "CHAR_TO_TOKEN_RATIO": 4,
+                    "AUTO_LIMIT_CONTEXT": True
+                }
+            },
+            "RESPONSE_QUALITY": {
+                "REMOVE_LATEX_FORMATTING": True,
+                "ENABLE_VALIDATION": True,
+                "MAX_PLAN_STEPS": 3,
+                "FALLBACK_ON_ERROR": True
+            },
+            "LOGGING": {
+                "LEVEL": "INFO",
+                "LOG_PROMPTS": True,
+                "LOG_PERFORMANCE": True,
+                "LOG_CACHE_STATS": True
+            }
+        }
+        
         try:
             config_path = Path("config_oci.yaml")
             if not config_path.exists():
-                print("Warning: config_oci.yaml not found. Using empty configuration.")
-                return {}
+                print("Warning: config_oci.yaml not found. Using default configuration.")
+                return default_config
             
             if yaml is None:
                 print("Warning: yaml module not available. Cannot load config file.")
-                return {}
+                return default_config
                 
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f)
-            return config if config else {}
+                
+            if not config:
+                return default_config
+                
+            # Merge loaded config with defaults (deep merge)
+            def deep_merge(default: Dict, loaded: Dict) -> Dict:
+                """Deep merge loaded config with defaults"""
+                result = default.copy()
+                for key, value in loaded.items():
+                    if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                        result[key] = deep_merge(result[key], value)
+                    else:
+                        result[key] = value
+                return result
+            
+            merged_config = deep_merge(default_config, config)
+            return merged_config
+            
         except Exception as e:
-            print(f"Warning: Error loading config: {str(e)}")
-            return {}
+            print(f"Warning: Error loading config: {str(e)}. Using default configuration.")
+            return default_config
 
 def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
     """Process a query request using the RAG agent"""
@@ -1120,9 +1277,7 @@ def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
                 model_id=model_id,
                 compartment_id=compartment_id,
                 use_stream=False,
-                max_chunks_per_step=2,
-                max_findings_per_step=3,
-                max_tokens_per_finding=1000
+                config=credentials  # Pass the full configuration
             )
         
         # Log cache stats for monitoring optimization effectiveness
@@ -1203,20 +1358,32 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Show full content of sources")
     parser.add_argument("--use-stream", action="store_true", help="Enable streaming responses from OCI Gen AI")
     parser.add_argument("--vector-db", default="oracle", choices=["postgres", "oracle"], help="Type of vector database to use")
-    parser.add_argument("--max-chunks-per-step", type=int, default=2, 
-                        help="Maximum chunks per research step (default: 2)")
-    parser.add_argument("--max-findings-per-step", type=int, default=3, 
-                        help="Maximum findings per research step (default: 3)")
-    parser.add_argument("--max-tokens-per-finding", type=int, default=1000, 
-                        help="Maximum tokens per finding (default: 1000)")
+    parser.add_argument("--max-chunks-per-step", type=int, 
+                        help="Maximum chunks per research step (overrides config file, default from config: varies)")
+    parser.add_argument("--max-findings-per-step", type=int, 
+                        help="Maximum findings per research step (overrides config file, default from config: varies)")
+    parser.add_argument("--max-tokens-per-finding", type=int, 
+                        help="Maximum tokens per finding (overrides config file, default from config: varies)")
+    parser.add_argument("--max-results", type=int, 
+                        help="Maximum similarity search results (overrides config file, default from config: 5)")
 
     args = parser.parse_args()
     
     # Load environment variables
     load_dotenv()
     
-     # Load Postgres DB credentials from config_pg.yaml
+    # Load configuration from config file
     credentials = load_config()
+    
+    # Override config values with command line arguments if provided
+    if args.max_chunks_per_step is not None:
+        credentials.setdefault("SIMILARITY_SEARCH", {})["MAX_CHUNKS_PER_STEP"] = args.max_chunks_per_step
+    if args.max_findings_per_step is not None:
+        credentials.setdefault("SIMILARITY_SEARCH", {})["MAX_FINDINGS_PER_STEP"] = args.max_findings_per_step
+    if args.max_tokens_per_finding is not None:
+        credentials.setdefault("SIMILARITY_SEARCH", {})["MAX_TOKENS_PER_FINDING"] = args.max_tokens_per_finding
+    if args.max_results is not None:
+        credentials.setdefault("SIMILARITY_SEARCH", {})["MAX_RESULTS"] = args.max_results
 
     compartment_id  = args.compartment_id or credentials.get("OCI_COMPARTMENT_ID", "")
     collection = args.collection or credentials.get("COLLECTION", "PDF Collection")
@@ -1257,9 +1424,7 @@ def main():
             model_id=model_id,
             compartment_id=compartment_id,
             use_stream=args.use_stream,
-            max_chunks_per_step=args.max_chunks_per_step,
-            max_findings_per_step=args.max_findings_per_step,
-            max_tokens_per_finding=args.max_tokens_per_finding
+            config=credentials  # Pass the full configuration instead of individual parameters
         )
     
         

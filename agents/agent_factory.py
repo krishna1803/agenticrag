@@ -166,16 +166,16 @@ class ResearchAgent(Agent):
             vector_store=vector_store
         )
 
-    def research(self, query: str, step: str, max_chunks: int = 3, max_findings: int = 3, max_tokens: int = 1000) -> List[Dict[str, Any]]:
+    def research(self, query: str, step: str, max_chunks: int = 3, max_findings: int = 3, max_tokens: int = 1000, max_results: int = 5) -> List[Dict[str, Any]]:
         logger.info(f"\n🔍 Researching for step: {step}")
         
-        # Query all collections with limits
-        pdf_results = self.vector_store.query_pdf_collection(query, n_results=max_chunks)
-        repo_results = self.vector_store.query_repo_collection(query, n_results=max_chunks)
+        # Query all collections with configurable limits
+        pdf_results = self.vector_store.query_pdf_collection(query, n_results=max_results)
+        repo_results = self.vector_store.query_repo_collection(query, n_results=max_results)
         
         # Combine and limit results
         all_results = (pdf_results + repo_results)[:max_chunks]
-        logger.info(f"Found {len(all_results)} relevant documents (limited to {max_chunks})")
+        logger.info(f"Found {len(all_results)} relevant documents (limited to {max_chunks} from {max_results} max search results)")
         
         if not all_results:
             logger.warning("No relevant documents found")
