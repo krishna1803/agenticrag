@@ -165,21 +165,23 @@ class LLMBatchProcessor:
         return self.batch_process_requests(reasoning_requests)
 
 @lru_cache(maxsize=10)  # Priority 3: Cache agent creation
-def get_cached_agents(model_id: str, compartment_id: str, vector_store_id: str, cache_config: Dict[str, Any] = None):
-    """Get cached agents to avoid repeated initialization"""
-    # Check if LLM caching is enabled
-    if cache_config is None:
-        cache_config = {}
-    
-    llm_caching_enabled = cache_config.get("LLM_CACHING_ENABLED", True)
-    
+# Removed cache_config param to keep lru_cache arguments hashable (dicts are unhashable)
+def get_cached_agents(model_id: str, compartment_id: str, vector_store_id: str):
+    """Get cached agents to avoid repeated initialization.
+    Only depends on hashable identifiers; configuration dict handled outside.
+    """
+    # Ensure global caches exist
+    if not isinstance(model_id, str):
+        model_id = str(model_id)
+    if not isinstance(compartment_id, str):
+        compartment_id = str(compartment_id)
+    if not isinstance(vector_store_id, str):
+        vector_store_id = str(vector_store_id)
     cache_key = f"{model_id}_{compartment_id}_{vector_store_id}"
     
     if cache_key not in _agent_cache:
-        # Create LLM based on caching configuration
         llm_cache_key = f"{model_id}_{compartment_id}"
-        
-        if llm_caching_enabled and llm_cache_key not in _llm_cache:
+        if llm_cache_key not in _llm_cache:
             logger.info(f"Creating and caching new LLM instance for {llm_cache_key}")
             config = load_oci_config()
             _llm_cache[llm_cache_key] = ChatOCIGenAI(
@@ -190,26 +192,9 @@ def get_cached_agents(model_id: str, compartment_id: str, vector_store_id: str, 
                 is_stream=False,
                 model_kwargs={"temperature": 0, "max_tokens": 1500}
             )
-            llm = _llm_cache[llm_cache_key]
-        elif llm_caching_enabled and llm_cache_key in _llm_cache:
-            logger.info(f"Using cached LLM instance for {llm_cache_key}")
-            llm = _llm_cache[llm_cache_key]
         else:
-            # LLM caching disabled - create fresh LLM instance
-            logger.info(f"LLM caching disabled - creating fresh LLM instance for {llm_cache_key}")
-            config = load_oci_config()
-            llm = ChatOCIGenAI(
-                auth_profile=CONFIG_PROFILE,
-                model_id=model_id,
-                compartment_id=compartment_id,
-                service_endpoint="https://inference.generativeai.us-chicago-1.oci.oraclecloud.com",
-                is_stream=False,
-                model_kwargs={"temperature": 0, "max_tokens": 1500}
-            )
-        
-        # Create agents cache entry
-        # Note: We can't cache vector_store directly due to connection state
-        # So we'll cache the agents structure but create vector_store fresh
+            logger.info(f"Using cached LLM instance for {llm_cache_key}")
+        llm = _llm_cache[llm_cache_key]
         _agent_cache[cache_key] = {
             'llm': llm,
             'structure': None  # Will be created when vector_store is available
@@ -285,7 +270,7 @@ class OCIRAGAgent:
 
         # Priority 3: Use cached LLM and agent initialization
         vector_store_id = str(hash(str(vector_store))) if vector_store else "none"
-        cached_data = get_cached_agents(model_id, self.compartment_id, vector_store_id, self.cache_config)
+        cached_data = get_cached_agents(model_id, self.compartment_id, vector_store_id)
         
         self.genai_client = cached_data['llm']
         
