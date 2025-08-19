@@ -158,14 +158,22 @@ class LLMBatchProcessor:
         return self.batch_process_requests(reasoning_requests)
 
 @lru_cache(maxsize=10)  # Priority 3: Cache agent creation
-def get_cached_agents(model_id: str, compartment_id: str, vector_store_id: str):
+def get_cached_agents(model_id: str, compartment_id: str, vector_store_id: str, cache_config: Dict[str, Any] = None):
     """Get cached agents to avoid repeated initialization"""
+    # Check if LLM caching is enabled
+    if cache_config is None:
+        cache_config = {}
+    
+    llm_caching_enabled = cache_config.get("LLM_CACHING_ENABLED", True)
+    
     cache_key = f"{model_id}_{compartment_id}_{vector_store_id}"
     
     if cache_key not in _agent_cache:
-        # Create LLM if not cached
+        # Create LLM based on caching configuration
         llm_cache_key = f"{model_id}_{compartment_id}"
-        if llm_cache_key not in _llm_cache:
+        
+        if llm_caching_enabled and llm_cache_key not in _llm_cache:
+            logger.info(f"Creating and caching new LLM instance for {llm_cache_key}")
             config = load_oci_config()
             _llm_cache[llm_cache_key] = ChatOCIGenAI(
                 auth_profile=CONFIG_PROFILE,
@@ -175,15 +183,32 @@ def get_cached_agents(model_id: str, compartment_id: str, vector_store_id: str):
                 is_stream=False,
                 model_kwargs={"temperature": 0, "max_tokens": 1500}
             )
+            llm = _llm_cache[llm_cache_key]
+        elif llm_caching_enabled and llm_cache_key in _llm_cache:
+            logger.info(f"Using cached LLM instance for {llm_cache_key}")
+            llm = _llm_cache[llm_cache_key]
+        else:
+            # LLM caching disabled - create fresh LLM instance
+            logger.info(f"LLM caching disabled - creating fresh LLM instance for {llm_cache_key}")
+            config = load_oci_config()
+            llm = ChatOCIGenAI(
+                auth_profile=CONFIG_PROFILE,
+                model_id=model_id,
+                compartment_id=compartment_id,
+                service_endpoint="https://inference.generativeai.us-chicago-1.oci.oraclecloud.com",
+                is_stream=False,
+                model_kwargs={"temperature": 0, "max_tokens": 1500}
+            )
         
-        # Create agents with cached LLM
-        llm = _llm_cache[llm_cache_key]
+        # Create agents cache entry
         # Note: We can't cache vector_store directly due to connection state
         # So we'll cache the agents structure but create vector_store fresh
         _agent_cache[cache_key] = {
             'llm': llm,
             'structure': None  # Will be created when vector_store is available
         }
+    else:
+        logger.info(f"Using existing cache entry for {cache_key}")
     
     return _agent_cache[cache_key]
 DEBUG = False  # Set to True for detailed debug output
@@ -249,15 +274,26 @@ class OCIRAGAgent:
 
         # Priority 3: Use cached LLM and agent initialization
         vector_store_id = str(hash(str(vector_store))) if vector_store else "none"
-        cached_data = get_cached_agents(model_id, self.compartment_id, vector_store_id)
+        cached_data = get_cached_agents(model_id, self.compartment_id, vector_store_id, self.cache_config)
         
         self.genai_client = cached_data['llm']
         
-        # Initialize specialized agents with caching
+        # Initialize specialized agents with configurable caching
         if use_cot:
-            if cached_data['structure'] is None:
+            # Check if agent caching is enabled in configuration
+            agent_caching_enabled = self.cache_config.get("AGENT_CACHING_ENABLED", True)
+            
+            if agent_caching_enabled and cached_data['structure'] is None:
+                logger.info("Creating and caching new agent structure")
                 cached_data['structure'] = create_agents(self.genai_client, vector_store)
-            self.agents = cached_data['structure']
+                self.agents = cached_data['structure']
+            elif agent_caching_enabled and cached_data['structure'] is not None:
+                logger.info("Using cached agent structure")
+                self.agents = cached_data['structure']
+            else:
+                # Agent caching disabled - create fresh agents for each instance
+                logger.info("Agent caching disabled - creating fresh agents")
+                self.agents = create_agents(self.genai_client, vector_store)
         else:
             self.agents = None
         
@@ -329,6 +365,46 @@ class OCIRAGAgent:
         _agent_cache.clear()
         logger.info("All caches cleared")
     
+    def clear_agent_context(self):
+        """Clear any context or state from agents to prevent bleeding between queries"""
+        if self.agents and isinstance(self.agents, dict):
+            logger.info("Clearing agent context to prevent bleeding between queries")
+            
+            # If agents have a reset or clear method, call it
+            for agent_name, agent in self.agents.items():
+                if hasattr(agent, 'clear_context'):
+                    agent.clear_context()
+                    logger.debug(f"Cleared context for {agent_name} agent")
+                elif hasattr(agent, 'reset'):
+                    agent.reset()
+                    logger.debug(f"Reset {agent_name} agent")
+    
+    def get_cache_config(self) -> Dict[str, Any]:
+        """Get current cache configuration"""
+        return {
+            "llm_caching_enabled": self.cache_config.get("LLM_CACHING_ENABLED", True),
+            "agent_caching_enabled": self.cache_config.get("AGENT_CACHING_ENABLED", True),
+            "cache_enabled": self.cache_config.get("ENABLED", True),
+            "llm_cache_size": len(_llm_cache),
+            "agent_cache_size": len(_agent_cache),
+            "current_llm_cache_keys": list(_llm_cache.keys()),
+            "current_agent_cache_keys": list(_agent_cache.keys())
+        }
+    
+    def disable_caching(self):
+        """Disable all caching for this instance"""
+        logger.info("Disabling caching for this RAG agent instance")
+        self.cache_config["ENABLED"] = False
+        self.cache_config["LLM_CACHING_ENABLED"] = False
+        self.cache_config["AGENT_CACHING_ENABLED"] = False
+    
+    def enable_caching(self):
+        """Enable caching for this instance"""
+        logger.info("Enabling caching for this RAG agent instance")
+        self.cache_config["ENABLED"] = True
+        self.cache_config["LLM_CACHING_ENABLED"] = True
+        self.cache_config["AGENT_CACHING_ENABLED"] = True
+
     def process_query(self, query: str) -> Dict[str, Any]:
         """Process a user query using the agentic RAG pipeline"""
         logger.info(f"Processing query with collection: {self.collection}")
@@ -346,463 +422,47 @@ class OCIRAGAgent:
                 return self._process_query_with_cot(query)
             else:
                 return self._process_query_standard(query)
-    
-    def _process_query_with_cot(self, query: str) -> Dict[str, Any]:
-        """Process query using Chain of Thought reasoning with multiple agents"""
-        logger.info("Processing query with Chain of Thought reasoning")
-        cot_start_time = time.time()
-        
-        # Get initial context based on selected collection
-        initial_context = []
-        try:
-            # Fetch context (collection-specific code remains the same)
-            if self.collection == "PDF Collection":
-                logger.info(f"Retrieving context from PDF Collection for query: '{query}'")
-                pdf_context = self.vector_store.query_pdf_collection(query)
-                initial_context.extend(pdf_context)
-                logger.info(f"Retrieved {len(pdf_context)} chunks from PDF Collection")
-                # Log each chunk with citation number but not full content
-                for i, chunk in enumerate(pdf_context):
-                    source = chunk["metadata"].get("source", "Unknown")
-                    pages = chunk["metadata"].get("page_numbers", [])
-                    logger.info(f"Source [{i+1}]: {source} (pages: {pages})")
-                    content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
-                    logger.info(f"Content preview for source [{i+1}]: {content_preview}")
-            elif self.collection == "Repository Collection":
-                logger.info(f"Retrieving context from Repository Collection for query: '{query}'")
-                repo_context = self.vector_store.query_repo_collection(query)
-                initial_context.extend(repo_context)
-                logger.info(f"Retrieved {len(repo_context)} chunks from Repository Collection")
-                for i, chunk in enumerate(repo_context):
-                    source = chunk["metadata"].get("source", "Unknown")
-                    file_path = chunk["metadata"].get("file_path", "Unknown")
-                    logger.info(f"Source [{i+1}]: {source} (file: {file_path})")
-                    content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
-                    logger.info(f"Content preview for source [{i+1}]: {content_preview}")
-            elif self.collection == "Web Knowledge Base":
-                logger.info(f"Retrieving context from Web Knowledge Base for query: '{query}'")
-                web_context = self.vector_store.query_web_collection(query)
-                initial_context.extend(web_context)
-                logger.info(f"Retrieved {len(web_context)} chunks from Web Knowledge Base")
-                for i, chunk in enumerate(web_context):
-                    source = chunk["metadata"].get("source", "Unknown")
-                    title = chunk["metadata"].get("title", "Unknown")
-                    logger.info(f"Source [{i+1}]: {source} (title: {title})")
-                    content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
-                    logger.info(f"Content preview for source [{i+1}]: {content_preview}")
-            else:
-                logger.info("Using General Knowledge collection, no context retrieval needed")
-            
-            # Apply token budget to context
-            initial_context = self._limit_context(initial_context, max_tokens=40000)
-            
-            # Step 1: Planning - Get steps to follow
-            logger.info("Step 1: Planning")
-            if not self.agents or "planner" not in self.agents:
-                logger.warning("No planner agent available, using direct response")
-                return self._generate_general_response(query)
-            
-            try:
-                plan = self.agents["planner"].plan(query, initial_context)
-                logger.info(f"Generated plan:\n{plan}")
-            except Exception as e:
-                logger.error(f"Error in planning step: {str(e)}")
-                logger.info("Falling back to general response")
-                return self._generate_general_response(query)
-            
-            # Step 2: Research each step (parallel execution with optimized batching)
-            logger.info("Step 2: Research (parallel execution with batch optimization)")
-            research_start_time = time.time()
-            
-            plan_steps = [step for step in plan.split("\n") if step.strip()]
-            if len(plan_steps) > self.max_plan_steps:
-                logger.info(f"Limiting plan from {len(plan_steps)} steps to {self.max_plan_steps} steps (configurable)")
-                plan_steps = plan_steps[:self.max_plan_steps]
 
-            # Use improved parallel processing with ThreadPoolExecutor
-            try:
-                if self.parallel_config.get("ENABLED", True) and self.parallel_config.get("USE_THREAD_POOL", True):
-                    logger.info("Attempting parallel research execution with ThreadPoolExecutor")
-                    research_results = self._research_steps_parallel_fixed(query, plan_steps)
-                else:
-                    logger.info("Parallel processing disabled, using sequential research")
-                    research_results = self._research_steps_sequential(query, plan_steps)
-                    
-                research_duration = time.time() - research_start_time
-                logger.info(f"Research completed for {len(research_results)} steps in {research_duration:.2f} seconds")
-            
-            except Exception as e:
-                logger.error(f"Error in research: {str(e)}")
-                if self.fallback_on_error:
-                    logger.info("Falling back to sequential research")
-                    research_results = self._research_steps_sequential(query, plan_steps)
-                    research_duration = time.time() - research_start_time
-                    logger.info(f"Sequential research completed in {research_duration:.2f} seconds")
-                else:
-                    raise e
-            
-            # Step 3: Batch reasoning for better efficiency
-            logger.info("Step 3: Reasoning (batch processing)")
-            reasoning_steps = []
-            
-            # Try batch reasoning first for better performance
-            try:
-                if self.batch_processor and self.batch_config.get("ENABLED", True):
-                    logger.info("Attempting batch reasoning processing")
-                    batch_start_time = time.time()
-                    
-                    # Use the batch processor for reasoning
-                    batch_reasoning_results = self.batch_processor.batch_reasoning_requests(query, research_results)
-                    
-                    # Convert batch results to reasoning steps
-                    for i, result in enumerate(batch_reasoning_results):
-                        if result and not result.startswith("Error"):
-                            reasoning_steps.append(result)
-                        else:
-                            logger.warning(f"Batch reasoning failed for step {i+1}, using fallback")
-                            # Fall back to individual reasoning for this step
-                            research_result = research_results[i] if i < len(research_results) else None
-                            if research_result and self.agents.get("reasoner") and research_result.get("findings"):
-                                findings = research_result["findings"] or [{"content": "No specific information found.", 
-                                                                       "metadata": {"source": "General Knowledge"}}]
-                                if findings:
-                                    step_reasoning = self.agents["reasoner"].reason(query, research_result["step"], findings)
-                                    reasoning_steps.append(step_reasoning)
-                            else:
-                                reasoning_steps.append(f"For {research_result['step'] if research_result else 'unknown step'}, insufficient information was found.")
-                    
-                    batch_duration = time.time() - batch_start_time
-                    logger.info(f"Batch reasoning completed in {batch_duration:.2f} seconds for {len(reasoning_steps)} steps")
-                else:
-                    logger.info("Batch processing disabled, using sequential reasoning")
-                    # Use sequential reasoning
-                    for result in research_results:
-                        try:
-                            if self.agents.get("reasoner") and result.get("findings"):
-                                findings = result["findings"] or [{"content": "No specific information found.", 
-                                                               "metadata": {"source": "General Knowledge"}}]
-                                # Only process if we have findings
-                                if findings:
-                                    step_reasoning = self.agents["reasoner"].reason(query, result["step"], findings)
-                                    reasoning_steps.append(step_reasoning)
-                        except Exception as e:
-                            logger.error(f"Error reasoning about step '{result['step']}': {str(e)}")
-                            # Add a fallback reasoning if the step fails
-                            reasoning_steps.append(f"For {result['step']}, insufficient information was found.")
-                
-            except Exception as e:
-                logger.error(f"Error in reasoning: {str(e)}")
-                if self.fallback_on_error:
-                    logger.info("Falling back to sequential reasoning")
-                    
-                    # Fall back to sequential reasoning if batch fails
-                    for result in research_results:
-                        try:
-                            if self.agents.get("reasoner") and result.get("findings"):  # Check if findings exist
-                                findings = result["findings"] or [{"content": "No specific information found.", 
-                                                               "metadata": {"source": "General Knowledge"}}]
-                                # Only process if we have findings
-                                if findings:
-                                    step_reasoning = self.agents["reasoner"].reason(query, result["step"], findings)
-                                    reasoning_steps.append(step_reasoning)
-                        except Exception as e:
-                            logger.error(f"Error reasoning about step '{result['step']}': {str(e)}")
-                            # Add a fallback reasoning if the step fails
-                            reasoning_steps.append(f"For {result['step']}, insufficient information was found.")
-                else:
-                    raise e
-
-            # Check if we have any reasoning steps before synthesis
-            if not reasoning_steps:
-                logger.warning("No valid reasoning steps generated. Using general response.")
-                return self._generate_general_response(query)
-            
-            # Step 4: Synthesize final answer with batch optimization
-            logger.info("Step 4: Synthesis (with batch optimization)")
-            # Before synthesis
-            logger.info(f"Reasoning steps count: {len(reasoning_steps)}")
-            if not reasoning_steps:
-                logger.error("No reasoning steps available for synthesis")
-                return self._generate_general_response(query)
-                
-            # Add debug info
-            for i, step in enumerate(reasoning_steps):
-                logger.info(f"Reasoning step {i+1} type: {type(step)}, length: {len(str(step))}")
-            
-            try:
-                # Use optimized batch synthesis first
-                logger.info("Attempting optimized batch synthesis")
-                final_answer = self._batch_synthesis_optimize(query, reasoning_steps)
-                
-                # Add explicit null check
-                if not final_answer:
-                    logger.warning("Empty response from optimized synthesis, falling back to agent synthesis")
-                    final_answer = self.agents["synthesizer"].synthesize(query, reasoning_steps)
-                    
-                if not final_answer:
-                    logger.error("Empty response from both synthesis methods")
-                    final_answer = "I was unable to generate a complete answer based on the available information."
-                
-                # Remove LaTeX formatting from final answer
-                final_answer = self._remove_latex_formatting(final_answer)
-                
-                total_duration = time.time() - cot_start_time
-                logger.info(f"Final synthesized answer generated - Total CoT time: {total_duration:.2f} seconds")
-                
-                return {
-                    "answer": final_answer,
-                    "context": initial_context,
-                    "reasoning_steps": reasoning_steps
-                }
-            except Exception as e:
-                logger.error(f"Error in synthesis step: {str(e)}")
-                import traceback
-                logger.error(traceback.format_exc())  # Print full stack trace
-                # Emergency fallback - join reasoning steps directly
-                fallback_answer = "\n\n".join([
-                    f"Step {i+1}: {step[:200]}..." 
-                    for i, step in enumerate(reasoning_steps) if isinstance(step, str) and step.strip()
-                ])
-                return {
-                    "answer": f"Here's what I found:\n\n{fallback_answer}",
-                    "context": initial_context,
-                    "reasoning_steps": reasoning_steps
-                }
-                
-        except Exception as e:
-            logger.error(f"Error in CoT processing: {str(e)}")
-            return self._generate_general_response(query)
-    
-    def _remove_latex_formatting(self, text: str) -> str:
-        """Remove LaTeX-style formatting from the text using regex for more robust cleaning"""
-        if not text:
-            return text
-        
-        import re
-        
-        # Use regex to clean boxed expressions and other LaTeX patterns
-        patterns = [
-            (r'\$\\boxed\{([^}]+)\}\$', r'\1'),  # $\boxed{text}$
-            (r'\$\\boxed\{([^}]+)\}', r'\1'),    # $\boxed{text}
-            (r'\\boxed\{([^}]+)\}\$', r'\1'),    # \boxed{text}$
-            (r'\\boxed\{([^}]+)\}', r'\1'),      # \boxed{text}
-            (r'boxed\{([^}]+)\}', r'\1'),        # boxed{text} without backslash
-        ]
-        
-        result = text
-        for pattern, replacement in patterns:
-            result = re.sub(pattern, replacement, result)
-        
-        # Remove any remaining LaTeX indicators
-        result = result.replace('$', '')
-        result = result.replace('\\', '')
-        result = result.replace('boxed{', '').replace('}', '')
-        
-        return result.strip()
-    
     def _process_query_standard(self, query: str) -> Dict[str, Any]:
         """Process query using standard approach without Chain of Thought"""
-        # Initialize context variables
         context = []
         
         # Get context based on selected collection
         if self.collection == "PDF Collection":
-            logger.info(f"Retrieving context from PDF Collection for query: '{query}'")
             context = self.vector_store.query_pdf_collection(query)
-            logger.info(f"Retrieved {len(context)} chunks from PDF Collection")
-            for i, chunk in enumerate(context):
-                source = chunk["metadata"].get("source", "Unknown")
-                pages = chunk["metadata"].get("page_numbers", [])
-                logger.info(f"Source [{i+1}]: {source} (pages: {pages})")
-                content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
-                logger.debug(f"Content preview for source [{i+1}]: {content_preview}")
         elif self.collection == "Repository Collection":
-            logger.info(f"Retrieving context from Repository Collection for query: '{query}'")
             context = self.vector_store.query_repo_collection(query)
-            logger.info(f"Retrieved {len(context)} chunks from Repository Collection")
-            for i, chunk in enumerate(context):
-                source = chunk["metadata"].get("source", "Unknown")
-                file_path = chunk["metadata"].get("file_path", "Unknown")
-                logger.info(f"Source [{i+1}]: {source} (file: {file_path})")
-                content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
-                logger.debug(f"Content preview for source [{i+1}]: {content_preview}")
         elif self.collection == "Web Knowledge Base":
-            logger.info(f"Retrieving context from Web Knowledge Base for query: '{query}'")
             context = self.vector_store.query_web_collection(query)
-            logger.info(f"Retrieved {len(context)} chunks from Web Knowledge Base")
-            for i, chunk in enumerate(context):
-                source = chunk["metadata"].get("source", "Unknown")
-                title = chunk["metadata"].get("title", "Unknown")
-                logger.info(f"Source [{i+1}]: {source} (title: {title})")
-                content_preview = chunk["content"][:150] + "..." if len(chunk["content"]) > 150 else chunk["content"]
-                logger.debug(f"Content preview for source [{i+1}]: {content_preview}")
         
         # Generate response using context if available, otherwise use general knowledge
         if context:
-            logger.info(f"Generating response using {len(context)} context chunks")
             response = self._generate_response(query, context)
         else:
-            logger.info("No context found, using general knowledge")
             response = self._generate_general_response(query)
         
         return response
-    
+
     def _generate_response(self, query: str, context: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Generate a response based on the query and context using OCI Generative AI"""
-        # Format context for the prompt
         formatted_context = "\n\n".join([f"Context {i+1}:\n{item['content']}" 
                                        for i, item in enumerate(context)])
         
-        #system_prompt = """You are an AI assistant answering questions based on the provided context.
-#Answer the question based on the context provided. If the answer is not in the context, say "I don't have enough information to answer this question." Be concise and accurate."""
-        
-        #user_content = f"Context:\n{formatted_context}\n\nQuestion: {query}"
-        
-        prompt_template = """## AustLII AI Legal Research Assistant - System Instructions
+        prompt_template = """## Query or Task
+{query}
 
-            You are a legal research assistant. Your task is to answer ONLY from the retrieved legal documents and references and citations provided below.
+## Retrieved Documents
+{formatted_context}
 
-            **Critical Constraints:**
-            - Do NOT use outside knowledge unless explicitly authorised.
-            - Do NOT reference legal principles, legislation, or cases not mentioned in the provided documents.
-            - Do NOT add missing details to citations or complete partial references.
-            - Do not make assumptions, guesses, or inferences beyond the text.
-            - Do NOT invent content.
-            - If you find yourself drawing on legal knowledge beyond the documents, stop and use the fallback response.
-
-            **If the answer is not in the provided documents, respond exactly with:**
-            - "I do not have enough information to address your query."
-
-            You must follow the Response Rules exactly.
-
-            ---
-
-            ## Query or Task
-            {query}
-
-            ---
-
-            ## Retrieved Documents
-            The following legal documents were retrieved from AustLII. These are your only sources. Refer to them as [#].
-
-            {formatted_context}
-
-
-            ---
-
-            ## Response Rules
-
-            Unless the user asks for 'explanation,' limit the response to a direct answer to the query and no need to output the explanation of each step below.
-
-            1. **Evidence-first approach**
-            - Identify and quote/paraphrase only relevant sections from the provided documents.
-            - Attribute every quote/paraphrase to [#].
-
-            2. **Summary step**
-            - Summarise the key points from the identified sections.
-            - Do not add interpretation beyond what is explicitly in the documents.
-
-            3. **Final answer construction**
-            - Write your final answer strictly from the summary in step 2.
-            - Every factual claim must be supported by a [#] citation.
-
-            4. **Response format**
-            - Unless the user asks for 'explanation,' limit the response to a direct answer to the query subject to length limits in Response Requirements.
-            - When asked for 'explanation,' provide a step-by-step breakdown.
-
-            5. **Response Requirements**
-            Length Limits:
-            - Simple factual queries: 1-2 sentences maximum
-            - Case summaries: 2-3 sentences maximum
-            - Multi-part questions: Up to 5 sentences maximum
-            - Complex analysis (explicit user request): Up to 8 sentences maximum
-            - Document comparisons: Up to 6 sentences maximum
-
-            When More Detail is Needed:
-            If user requires comprehensive information, respond with available details within limits, then add: "For additional analysis, please ask specific follow-up questions about [list 2-3 specific aspects mentioned in documents]."
-
-            Override Conditions:
-            Exceed sentence limits ONLY when:
-            - Documents contain extensive directly quoted relevant material on the exact query
-            - User explicitly requests "detailed analysis with all available information"
-            - Multiple documents provide substantial overlapping content on the same narrow topic
-
-            6. **Style and formatting**
-            - Use Australian English and formal legal language.
-            - First mention of a case → full case name and citation
-            - First mention of legislation → short title + jurisdiction
-
-            7. **If no answer is found**
-            - Reply: "I do not have enough information to address your query."
-            - Do not guess or infer.
-
-            ---
-
-            ## Self-check before final output
-            - Have I used ONLY the provided documents?
-            - Does every factual claim have a [#] citation?
-            - Have I avoided assumptions or external knowledge?
-            - Have I avoided referencing cases, legislation, or legal principles not mentioned in the documents?
-            - Have I avoided adding or completing citation/reference details not in the documents?
-            - Have I used Australian English and the required citation format?
-            """
+## Response
+Answer the question based on the context provided. If the answer is not in the context, say "I don't have enough information to answer this question." Be concise and accurate."""
 
         prompt = PromptTemplate.from_template(prompt_template)
+        formatted_prompt = prompt.format(query=query, formatted_context=formatted_context)
         
-        logger.info("Generating response using OCI Generative AI")
-        logger.info(f"Query: {query}")
-        logger.info(f"Context size: {len(formatted_context)} characters")
-        logger.info(f"prompt: {prompt_template}")
-        
-        if self.use_stream:
-            print("Generating streaming response...")
-            chain = (
-                prompt
-                | self.genai_client
-            )
-            currtime = time.time()
-            response = chain.invoke({"query": query,"formatted_context": formatted_context})
-            logger.info(f"Response from LLM generated in {time.time() - currtime:.2f} seconds")
-            # For streaming, we need to collect the tokens
-            answer = ""
-            for chunk in response:
-                content = chunk.content if hasattr(chunk, "content") else str(chunk)
-                print(content, end="", flush=True)
-                answer += content
-            print()  # Add newline after streaming completes
-        else:
-            # Non-streaming response - use direct LLM invocation
-            currtime = time.time()
-            formatted_prompt = prompt.format(query=query, formatted_context=formatted_context)
-            messages = [{"role": "user", "content": formatted_prompt}]
-            response = self.genai_client.invoke(messages)
-            answer = response.content if hasattr(response, 'content') else str(response)
-            logger.info(f"Response from LLM generated in {time.time() - currtime:.2f} seconds")
-
-        # Add sources to response if available
-        sources = {}
-        if context:
-            # Group sources by document
-            for item in context:
-                source = item['metadata'].get('source', 'Unknown')
-                if source not in sources:
-                    sources[source] = set()
-                
-                # Add page number if available
-                if 'page' in item['metadata']:
-                    sources[source].add(str(item['metadata']['page']))
-                # Add file path if available for code
-                if 'file_path' in item['metadata']:
-                    sources[source] = item['metadata']['file_path']
-            
-            # Print concise source information
-            print("\nSources detected:")
-            for source, details in sources.items():
-                if isinstance(details, set):  # PDF with pages
-                    pages = ", ".join(sorted(details))
-                    print(f"Document: {source} (pages: {pages})")
-                else:  # Code with file path
-                    print(f"Code file: {source}")
+        messages = [{"role": "user", "content": formatted_prompt}]
+        response = self.genai_client.invoke(messages)
+        answer = response.content if hasattr(response, 'content') else str(response)
         
         return {
             "answer": answer,
@@ -813,540 +473,216 @@ class OCIRAGAgent:
         """Generate a response using general knowledge when no context is available"""
         user_content = f"Query: {query}\n\nAnswer:"
         
-        currtime = time.time()
         messages = [{"role": "user", "content": user_content}]
         response = self.genai_client.invoke(messages)
         answer = response.content if hasattr(response, 'content') else str(response)
-        logger.info(f"General response generated in {time.time() - currtime:.2f} seconds")
-        # Return a general response without context
         
-        logger.info("No context available, using general knowledge response")    
         return {
             "answer": answer,
             "context": []
         }
-    
-    def _limit_context(self, documents: List[Dict[str, Any]], max_tokens: int = None) -> List[Dict[str, Any]]:
-        """Limit context to fit within a token budget"""
-        if not documents:
-            return []
-        
-        # Use provided max_tokens or fall back to config
-        if max_tokens is None:
-            max_tokens = self.context_config.get("MAX_TOKENS", 12000)
-        
-        # Check if auto-limiting is enabled
-        if not self.context_config.get("AUTO_LIMIT_CONTEXT", True):
-            logger.info("Context auto-limiting disabled, returning all documents")
-            return documents
-        
-        limited_docs = []
-        token_count = 0
-        
-        # Use configured character to token ratio
-        char_to_token_ratio = self.context_config.get("CHAR_TO_TOKEN_RATIO", 4)
-        
-        for doc in documents:
-            # Estimate tokens in this document
-            doc_tokens = len(doc["content"]) // char_to_token_ratio
-            
-            # If adding this would exceed budget, stop here
-            if token_count + doc_tokens > max_tokens:
-                # If we haven't added any documents yet, truncate this one
-                if not limited_docs:
-                    chars_to_keep = max_tokens * char_to_token_ratio
-                    truncated_content = doc["content"][:chars_to_keep] + "..."
-                    truncated_doc = doc.copy()
-                    truncated_doc["content"] = truncated_content
-                    limited_docs.append(truncated_doc)
-                    logger.info(f"Truncated document to fit token budget ({max_tokens} tokens)")
-                break
-            
-            limited_docs.append(doc)
-            token_count += doc_tokens
-        
-        logger.info(f"Limited context from {len(documents)} to {len(limited_docs)} documents (~{token_count} tokens, max: {max_tokens})")
-        return limited_docs
 
-    async def _research_steps_parallel(self, query: str, plan_steps: List[str]) -> List[Dict[str, Any]]:
-        """Process research steps in parallel with improved error handling"""
-        # Create a single executor for all tasks
-        executor = ThreadPoolExecutor(max_workers=min(len(plan_steps), 3))
-    
-        async def _research_single_step(step: str):
-            try:
-                # Use the executor passed from the parent function
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    executor,
-                    self.agents["researcher"].research,
-                    query, step, 
-                    self.max_chunks_per_step,
-                    self.max_findings_per_step,
-                    self.max_tokens_per_finding
-                )
-                return {"step": step, "findings": result}
-            except Exception as e:
-                logger.error(f"Error researching step '{step}': {str(e)}")
-                return {"step": step, "findings": []}
-    
+    def _process_query_with_cot(self, query: str) -> Dict[str, Any]:
+        """Process query using Chain of Thought reasoning with multiple agents"""
+        logger.info("Processing query with Chain of Thought reasoning")
+        
+        # Get initial context based on selected collection
+        initial_context = []
+        if self.collection == "PDF Collection":
+            initial_context = self.vector_store.query_pdf_collection(query)
+        elif self.collection == "Repository Collection":
+            initial_context = self.vector_store.query_repo_collection(query)
+        elif self.collection == "Web Knowledge Base":
+            initial_context = self.vector_store.query_web_collection(query)
+        
+        if not self.agents:
+            logger.warning("No agents available for CoT, falling back to standard response")
+            return self._generate_general_response(query)
+        
         try:
-            # Create tasks for all steps
-            tasks = [_research_single_step(step) for step in plan_steps]
-        
-            # Execute all research tasks concurrently with timeout
-            results = await asyncio.gather(*tasks)
-        
-            # Process results
+            # Step 1: Planning
+            plan = self.agents["planner"].plan(query, initial_context)
+            
+            # Step 2: Research
+            plan_steps = [step for step in plan.split("\n") if step.strip()]
             research_results = []
-            for result in results:
-                step = result["step"]
-                findings = result["findings"]
-                if isinstance(findings, list):
-                    research_results.append({"step": step, "findings": findings})
-                else:
-                    # Handle case where findings might be a dict with a 'findings' key
-                    findings_list = findings.get("findings", []) if isinstance(findings, dict) else []
-                    research_results.append({"step": step, "findings": findings_list})
             
-                logger.info(f"Research for step: {step} - Found {len(findings) if isinstance(findings, list) else 0} findings")
-        
-            return research_results
-    
-        finally:
-            # Always shut down the executor
-            executor.shutdown(wait=False)
-
-    def _batch_reasoning(self, query: str, research_results: List[Dict[str, Any]]) -> List[str]:
-        """Process multiple reasoning steps in a single batch"""
-        if not self.agents.get("reasoner"):
-            raise ValueError("No reasoner agent available")
-            
-        # Format all steps and findings for a single prompt
-        steps_text = []
-        for i, result in enumerate(research_results):
-            step = result["step"]
-            findings = result["findings"]
-            
-            # Format findings for this step
-            findings_text = ""
-            for j, finding in enumerate(findings[:2]):  # Limit to 2 findings per step
-                content = finding.get("content", "")[:300]  # Truncate long findings
-                source = finding.get("metadata", {}).get("source", "Unknown")
-                findings_text += f"Finding {j+1} ({source}): {content}\n\n"
-                
-            if not findings:
-                findings_text = "No specific information found for this step."
-                
-            # Add formatted step with its findings
-            steps_text.append(f"STEP {i+1}: {step}\n{findings_text}")
-            
-        # Join all steps
-        all_steps = "\n\n".join(steps_text)
-        
-        # Create a prompt template for batch reasoning
-        template = f"""Based on the query and research findings, provide clear reasoning for each step.
-
-Query: {{query}}
-
-{all_steps}
-
-Provide your analysis for each step separately:
-"""
-        
-        # Call the LLM directly through the reasoner's LLM
-        messages = [{"role": "user", "content": template.format(query=query)}]
-        
-        start_time = time.time()
-        response = self.agents["reasoner"].llm.invoke(messages)
-        logger.info(f"Batch reasoning completed in {time.time() - start_time:.2f} seconds")
-        
-        # Parse the response into separate reasoning steps
-        reasoning_text = response.content if hasattr(response, "content") else str(response)
-        
-        # Split by "STEP" markers
-        step_parts = reasoning_text.split("STEP")
-        reasoning_steps = []
-        
-        # Process each part (skip first empty part if exists)
-        for part in step_parts[1:] if step_parts[0].strip() == "" else step_parts:
-            if part.strip():
-                # Clean up and add to results
-                step_text = part.strip()
-                reasoning_steps.append(step_text)
-        
-        # If parsing failed, use whole response as one step
-        if not reasoning_steps:
-            reasoning_steps = [reasoning_text]
-            
-        return reasoning_steps
-
-    def _research_steps_sequential(self, query: str, plan_steps: List[str]) -> List[Dict[str, Any]]:
-        """Process research steps sequentially (no asyncio)"""
-        research_results = []
-        
-        for step in plan_steps:
-            try:
-                logger.info(f"Researching step: {step}")
-                findings = self.agents["researcher"].research(
-                    query, step, 
-                    self.max_chunks_per_step,
-                    self.max_findings_per_step,
-                    self.max_tokens_per_finding
-                )
-                research_results.append({"step": step, "findings": findings})
-                logger.info(f"Research for step: {step} - Found {len(findings) if isinstance(findings, list) else 0} findings")
-            except Exception as e:
-                logger.error(f"Error researching step '{step}': {str(e)}")
-                research_results.append({"step": step, "findings": []})
-        
-        return research_results
-
-    def _research_steps_parallel_fixed(self, query: str, plan_steps: List[str]) -> List[Dict[str, Any]]:
-        """Process research steps in parallel using ThreadPoolExecutor without asyncio complications"""
-        logger.info(f"Starting parallel research for {len(plan_steps)} steps")
-        start_time = time.time()
-        
-        # Use configured max workers
-        max_workers = min(len(plan_steps), self.parallel_config.get("MAX_WORKERS", 3))
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all research tasks
-            future_to_step = {}
             for step in plan_steps:
-                future = executor.submit(
-                    self._research_single_step,
-                    query, step,
-                    self.max_chunks_per_step,
-                    self.max_findings_per_step,
-                    self.max_tokens_per_finding
-                )
-                future_to_step[future] = step
+                findings = self.agents["researcher"].research(query, step)
+                research_results.append({"step": step, "findings": findings})
             
-            # Collect results as they complete
-            research_results = []
-            completed_count = 0
+            # Step 3: Reasoning
+            reasoning_steps = []
+            for result in research_results:
+                if result.get("findings"):
+                    step_reasoning = self.agents["reasoner"].reason(query, result["step"], result["findings"])
+                    reasoning_steps.append(step_reasoning)
             
-            # Use configured timeout
-            batch_timeout = self.batch_config.get("BATCH_TIMEOUT", 120)
-            request_timeout = self.batch_config.get("REQUEST_TIMEOUT", 60)
-            
-            for future in concurrent.futures.as_completed(future_to_step, timeout=batch_timeout):
-                step = future_to_step[future]
-                completed_count += 1
-                
-                try:
-                    findings = future.result(timeout=request_timeout)
-                    research_results.append({"step": step, "findings": findings})
-                    
-                    findings_count = len(findings) if isinstance(findings, list) else 0
-                    logger.info(f"Research completed for step ({completed_count}/{len(plan_steps)}): '{step}' - Found {findings_count} findings")
-                    
-                except Exception as e:
-                    logger.error(f"Error researching step '{step}': {str(e)}")
-                    research_results.append({"step": step, "findings": []})
-            
-            # Sort results to maintain step order
-            step_order = {step: i for i, step in enumerate(plan_steps)}
-            research_results.sort(key=lambda x: step_order.get(x["step"], 999))
-        
-        duration = time.time() - start_time
-        logger.info(f"Parallel research completed in {duration:.2f} seconds for {len(research_results)} steps with {max_workers} workers")
-        
-        return research_results
-    
-    def _research_single_step(self, query: str, step: str, max_chunks: int, max_findings: int, max_tokens: int):
-        """Execute research for a single step - designed to be thread-safe"""
-        try:
-            logger.info(f"Researching step: {step}")
-            
-            # Call the researcher agent's research method with configurable max_results
-            findings = self.agents["researcher"].research(
-                query, step, 
-                max_chunks,
-                max_findings,
-                max_tokens,
-                max_results=self.max_results  # Pass configured max_results
-            )
-            
-            # Ensure we return a list
-            if not isinstance(findings, list):
-                if isinstance(findings, dict) and "findings" in findings:
-                    findings = findings["findings"]
-                else:
-                    findings = []
-            
-            return findings
-            
-        except Exception as e:
-            logger.error(f"Error in _research_single_step for '{step}': {str(e)}")
-            return []
-
-    def _batch_synthesis_optimize(self, query: str, reasoning_steps: List[str]) -> str:
-        """
-        Optimized synthesis using batch processing when possible
-        
-        Args:
-            query: The original query
-            reasoning_steps: List of reasoning step results
-            
-        Returns:
-            Final synthesized answer
-        """
-        logger.info("Using optimized batch synthesis")
-        start_time = time.time()
-        
-        try:
-            # For synthesis, we typically need to combine all steps in one go
-            # So we'll prepare a single optimized prompt that processes all steps together
-            if not reasoning_steps:
-                return "I don't have enough valid analysis to provide a complete answer."
-            
-            # Create steps_str with optimization
-            steps_str = "\n\n".join([f"Step {i+1}:\n{step}" for i, step in enumerate(reasoning_steps)])
-            
-            # Use a streamlined prompt for faster processing
-            synthesis_prompt = f"""Combine the reasoning steps into a clear, comprehensive answer.
-
-Query: {query}
-Steps: {steps_str}
-
-Provide a direct, clear answer in plain text format. DO NOT use LaTeX notation, mathematical symbols like \\boxed{{}}, or markdown formatting.
-
-Answer:"""
-            
-            # Direct LLM call with optimized message structure
-            messages = [{"role": "user", "content": synthesis_prompt}]
-            response = self.genai_client.invoke(messages)
-            
-            # Handle different response formats
-            if hasattr(response, "content"):
-                result = response.content
-            elif isinstance(response, dict) and "content" in response:
-                result = response["content"]
-            elif isinstance(response, str):
-                result = response
+            # Step 4: Synthesis
+            if reasoning_steps:
+                final_answer = self.agents["synthesizer"].synthesize(query, reasoning_steps)
             else:
-                result = str(response)
+                final_answer = "I was unable to generate a complete answer based on the available information."
             
-            duration = time.time() - start_time
-            logger.info(f"Optimized batch synthesis completed in {duration:.2f} seconds")
-            
-            return result
+            return {
+                "answer": final_answer,
+                "context": initial_context,
+                "reasoning_steps": reasoning_steps
+            }
             
         except Exception as e:
-            logger.error(f"Error in batch synthesis optimization: {str(e)}")
-            # Fall back to agent-based synthesis
-            return self.agents["synthesizer"].synthesize(query, reasoning_steps)
+            logger.error(f"Error in CoT processing: {str(e)}")
+            return self._generate_general_response(query)
+
 
 def load_config() -> Dict[str, Any]:
-        """Load configuration from config_oci.yaml with default values"""
-        # Default configuration values
-        default_config = {
-            "OCI_COMPARTMENT_ID": "",
-            "OCI_MODEL_ID": "meta.llama-4-maverick-17b-128e-instruct-fp8",
-            "VECTOR_DB": "postgres",
-            "COLLECTION": "PDF Collection",
-            "USE_COT": False,
-            "SIMILARITY_SEARCH": {
-                "MAX_RESULTS": 3,
-                "MAX_CHUNKS_PER_STEP": 2,
-                "MAX_FINDINGS_PER_STEP": 3,
-                "MAX_TOKENS_PER_FINDING": 1000
+    """Load configuration from config_oci.yaml with default values"""
+    # Default configuration values
+    default_config = {
+        "OCI_COMPARTMENT_ID": "",
+        "OCI_MODEL_ID": "meta.llama-4-maverick-17b-128e-instruct-fp8",
+        "VECTOR_DB": "postgres",
+        "COLLECTION": "PDF Collection",
+        "USE_COT": False,
+        "SIMILARITY_SEARCH": {
+            "MAX_RESULTS": 3,
+            "MAX_CHUNKS_PER_STEP": 2,
+            "MAX_FINDINGS_PER_STEP": 3,
+            "MAX_TOKENS_PER_FINDING": 1000
+        },
+        "PERFORMANCE": {
+            "BATCH_PROCESSING": {
+                "ENABLED": True,
+                "MAX_CONCURRENT": 3,
+                "REQUEST_TIMEOUT": 60,
+                "BATCH_TIMEOUT": 120
             },
-            "PERFORMANCE": {
-                "BATCH_PROCESSING": {
-                    "ENABLED": True,
-                    "MAX_CONCURRENT": 3,
-                    "REQUEST_TIMEOUT": 60,
-                    "BATCH_TIMEOUT": 120
-                },
-                "CACHING": {
-                    "ENABLED": True,
-                    "LLM_CACHE_SIZE": 10,
-                    "AGENT_CACHE_SIZE": 10,
-                    "WARM_CACHE_ON_STARTUP": True
-                },
-                "PARALLEL_PROCESSING": {
-                    "ENABLED": True,
-                    "MAX_WORKERS": 3,
-                    "USE_THREAD_POOL": True
-                },
-                "CONTEXT": {
-                    "MAX_TOKENS": 12000,
-                    "CHAR_TO_TOKEN_RATIO": 4,
-                    "AUTO_LIMIT_CONTEXT": True
-                }
+            "CACHING": {
+                "ENABLED": True,
+                "LLM_CACHE_SIZE": 10,
+                "AGENT_CACHE_SIZE": 10,
+                "WARM_CACHE_ON_STARTUP": True
             },
-            "RESPONSE_QUALITY": {
-                "REMOVE_LATEX_FORMATTING": True,
-                "ENABLE_VALIDATION": True,
-                "MAX_PLAN_STEPS": 10,
-                "FALLBACK_ON_ERROR": True
+            "PARALLEL_PROCESSING": {
+                "ENABLED": True,
+                "MAX_WORKERS": 3,
+                "USE_THREAD_POOL": True
             },
-            "LOGGING": {
-                "LEVEL": "INFO",
-                "LOG_PROMPTS": True,
-                "LOG_PERFORMANCE": True,
-                "LOG_CACHE_STATS": True
+            "CONTEXT": {
+                "MAX_TOKENS": 12000,
+                "CHAR_TO_TOKEN_RATIO": 4,
+                "AUTO_LIMIT_CONTEXT": True
             }
+        },
+        "RESPONSE_QUALITY": {
+            "REMOVE_LATEX_FORMATTING": True,
+            "ENABLE_VALIDATION": True,
+            "MAX_PLAN_STEPS": 10,
+            "FALLBACK_ON_ERROR": True
+        },
+        "LOGGING": {
+            "LEVEL": "INFO",
+            "LOG_PROMPTS": True,
+            "LOG_PERFORMANCE": True,
+            "LOG_CACHE_STATS": True
         }
-        
-        try:
-            config_path = Path("config_oci.yaml")
-            if not config_path.exists():
-                print("Warning: config_oci.yaml not found. Using default configuration.")
-                return default_config
-            
-            if yaml is None:
-                print("Warning: yaml module not available. Cannot load config file.")
-                return default_config
-                
-            with open(config_path, 'r') as f:
-                config = yaml.safe_load(f)
-                
-            if not config:
-                return default_config
-                
-            # Merge loaded config with defaults (deep merge)
-            def deep_merge(default: Dict, loaded: Dict) -> Dict:
-                """Deep merge loaded config with defaults"""
-                result = default.copy()
-                for key, value in loaded.items():
-                    if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-                        result[key] = deep_merge(result[key], value)
-                    else:
-                        result[key] = value
-                return result
-            
-            merged_config = deep_merge(default_config, config)
-            return merged_config
-            
-        except Exception as e:
-            print(f"Warning: Error loading config: {str(e)}. Using default configuration.")
+    }
+    
+    try:
+        config_path = Path("config_oci.yaml")
+        if not config_path.exists():
+            logger.info("config_oci.yaml not found, using default configuration")
             return default_config
+        
+        if yaml is None:
+            logger.warning("PyYAML not available, using default configuration")
+            return default_config
+            
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+            
+        if not config:
+            logger.warning("Empty config file, using default configuration")
+            return default_config
+            
+        # Merge loaded config with defaults (deep merge)
+        def deep_merge(default: Dict, loaded: Dict) -> Dict:
+            result = default.copy()
+            for key, value in loaded.items():
+                if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                    result[key] = deep_merge(result[key], value)
+                else:
+                    result[key] = value
+            return result
+        
+        merged_config = deep_merge(default_config, config)
+        return merged_config
+        
+    except Exception as e:
+        print(f"Warning: Error loading config: {str(e)}. Using default configuration.")
+        return default_config
+
 
 def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
     """Process a query request using the RAG agent"""
     try:
-          # Load Postgres DB credentials from config_pg.yaml
+        # Load Postgres DB credentials from config_pg.yaml
         credentials = load_config()
 
-        compartment_id  = credentials.get("OCI_COMPARTMENT_ID", "")
+        compartment_id = credentials.get("OCI_COMPARTMENT_ID", "")
         collection = credentials.get("COLLECTION", "PDF Collection")
         model_id = request["model"] or credentials.get("OCI_MODEL_ID", "meta.llama-4-maverick-17b-128e-instruct-fp8")
         vector_db = credentials.get("VECTOR_DB", "postgres")
-        #The value in the request is a boolen, just pass it through
+        # The value in the request is a boolean, just pass it through
         use_cot = request.get("use_cot", False)
-
-        logger.info(f"Use Chain of Thought reasoning: {use_cot}")
 
         # Check for OCI compartment ID
         if not compartment_id:
-            print("✗ Error: OCI_COMPARTMENT_ID not found in config file or command line arguments")
-            print("Please set the OCI_COMPARTMENT_ID in config file or provide --compartment-id")
-            exit(1)
-            
-        # Priority 3: Warm cache for better initialization performance
-        logger.info("Warming LLM and agent caches for optimal performance")
-        OCIRAGAgent.warm_cache(model_id, compartment_id, [vector_db])
-        
-        #Create vector store based on vector_db type
+            return {"error": "OCI_COMPARTMENT_ID not found in config file"}
+
+        # Initialize vector store based on configuration
         if vector_db == "oracle":
             if not ORACLE_DB_AVAILABLE:
-                print("✗ Error: Oracle DB support is not available. Install with: pip install oracledb sentence-transformers")
-                exit(1)
+                return {"error": "Oracle DB support is not available. Install with: pip install oracledb sentence-transformers"}
+            
             # Initialize Oracle DB Vector Store
-            vector_db = OracleDBVectorStore(collection_name=collection)
-        else:   
+            store = OracleDBVectorStore(collection_name=collection)
+        else:
             # Initialize Postgres Vector Store (assuming similar interface)
             from PostgresVectorStore import PostgresVectorStore
-            print("Using Postgres Vector Store")
-            vector_db = PostgresVectorStore(collection_name=collection) 
-        if not vector_db:
-            print("✗ Error: Failed to initialize vector store")
-            exit(1)   
-    
-            # Use default OCI model
-        logger.info(f"Using model: {model_id} for collection: {collection} and compartment: {compartment_id} and use_cot {use_cot}")
-        # Initialize the RAG agent with the vector store and model (now with optimizations)    
-        rag_agent = OCIRAGAgent(
-                vector_store=vector_db,
-                use_cot=use_cot,
-                collection=collection,
-                model_id=model_id,
-                compartment_id=compartment_id,
-                use_stream=False,
-                config=credentials  # Pass the full configuration
-            )
-        
-        # Log cache stats for monitoring optimization effectiveness
-        cache_stats = rag_agent.get_cache_stats()
-        logger.info(f"Cache statistics: {cache_stats}")
-        
-        response = rag_agent.process_query(request["query"])
-        # In the main function, add this check before printing the answer
-        if "The final answer is:" in response["answer"]:
-            # Extract only what follows "The final answer is:"
-            response["answer"] = re.sub(r'.*The final answer is:\s*', '', response["answer"])
-            # Remove any remaining LaTeX formatting
-            response["answer"] = rag_agent._remove_latex_formatting(response["answer"])
+            store = PostgresVectorStore(collection_name=collection)
 
-        print("\nResponse:")
-        print("-" * 50)
-        print(response["answer"])
-        if response.get("reasoning_steps"):
-            print("\nReasoning Steps:")
-            print("-" * 50)
-            # Initialize reasoning as a list, not a dictionary
-            response["reasoning"] = []
-            
-            for i, step in enumerate(response["reasoning_steps"]):
-                print(f"\nStep {i+1}:")
-                print(step)
-                
-                # Convert step to string based on its type
-                if isinstance(step, list):
-                    step_text = " ".join([s.strip() for s in step if isinstance(s, str)])
-                elif isinstance(step, dict):
-                    step_text = " ".join([str(v).strip() for v in step.values() if isinstance(v, str)])
-                elif isinstance(step, str):
-                    # Handle the most common case - string
-                    step_text = step.strip()
-                else:
-                    # Fallback for any other type
-                    step_text = str(step).strip()
-                
-                # Add as a dictionary to the list (with step number and content)
-                response["reasoning"].append({
-                    "step": i+1,
-                    "content": step_text
-                })
+        if not store:
+            return {"error": "Failed to initialize vector store"}
 
+        # Create the agent
+        agent = OCIRAGAgent(
+            store,
+            use_cot=use_cot,
+            collection=collection,
+            model_id=model_id,
+            compartment_id=compartment_id,
+            use_stream=False,
+            config=credentials
+        )
+
+        # Process the query
+        response = agent.process_query(request["query"])
         
-        if response.get("context"):
-            print("\nSources used:")
-            print("-" * 50)
-            
-            # Print concise list of sources
-            for i, ctx in enumerate(response["context"]):
-                source = ctx["metadata"].get("source", "Unknown")
-                if "page_numbers" in ctx["metadata"]:
-                    pages = ctx["metadata"].get("page_numbers", [])
-                    print(f"[{i+1}] {source} (pages: {pages})")
-                else:
-                    file_path = ctx["metadata"].get("file_path", "Unknown")
-                    print(f"[{i+1}] {source} (file: {file_path})")
-                
         # Return the response dictionary
         return response
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
         return {"error": str(e)}
-        logger.error(f"Error processing request: {str(e)}")
-        return {"error": str(e)}
+
 
 def main():
+    import argparse
+    import os
+    import re
+    import traceback
+    from dotenv import load_dotenv
+    
     parser = argparse.ArgumentParser(description="Query documents using OCI Generative AI")
     parser.add_argument("--query", required=True, help="Query to process")
     parser.add_argument("--store-path", default="chroma_db", help="Path to the vector store")
@@ -1385,7 +721,7 @@ def main():
     if args.max_results is not None:
         credentials.setdefault("SIMILARITY_SEARCH", {})["MAX_RESULTS"] = args.max_results
 
-    compartment_id  = args.compartment_id or credentials.get("OCI_COMPARTMENT_ID", "")
+    compartment_id = args.compartment_id or credentials.get("OCI_COMPARTMENT_ID", "")
     collection = args.collection or credentials.get("COLLECTION", "PDF Collection")
     model_id = args.model_id or credentials.get("OCI_MODEL_ID", "meta.llama-4-maverick-17b-128e-instruct-fp8")
     vector_db = args.vector_db or credentials.get("VECTOR_DB", "postgres")
@@ -1427,7 +763,6 @@ def main():
             config=credentials  # Pass the full configuration instead of individual parameters
         )
     
-        
         print(f"\nProcessing query: {args.query}")
         print("=" * 50)
         
@@ -1438,7 +773,7 @@ def main():
             # Extract only what follows "The final answer is:"
             response["answer"] = re.sub(r'.*The final answer is:\s*', '', response["answer"])
             # Remove any remaining LaTeX formatting
-            response["answer"] = agent._remove_latex_formatting(response["answer"])
+            response["answer"] = re.sub(r'\\\\[.*?\\\\]|\\$.*?\\$|\\\\\(.*?\\\\\)', '', response["answer"])
         
         print("\nResponse:")
         print("-" * 50)
@@ -1447,9 +782,6 @@ def main():
         if response.get("reasoning_steps"):
             print("\nReasoning Steps:")
             print("-" * 50)
-            # Initialize reasoning as a list, not a dictionary
-            response["reasoning"] = []
-            
             for i, step in enumerate(response["reasoning_steps"]):
                 print(f"\nStep {i+1}:")
                 print(step)
@@ -1468,7 +800,6 @@ def main():
                     file_path = ctx["metadata"].get("file_path", "Unknown")
                     print(f"[{i+1}] {source} (file: {file_path})")
                 
-                # Only print content if verbose flag is set
                 if args.verbose:
                     content_preview = ctx["content"][:300] + "..." if len(ctx["content"]) > 300 else ctx["content"]
                     print(f"    Content: {content_preview}\n")
@@ -1476,6 +807,7 @@ def main():
     except Exception as e:
         print(f"\n✗ Error: {str(e)}")
         exit(1)
+
 
 if __name__ == "__main__":
     main()
