@@ -65,6 +65,78 @@ class PlannerAgent(Agent):
             description="Breaks down complex problems into manageable steps",
             llm=llm
         )
+    
+    # --- New robust step parsing ---
+    @staticmethod
+    def _parse_plan_steps(raw_plan: str, max_steps: int = 4) -> List[str]:
+        """Parse plan output into discrete steps using multiple heuristics.
+        Handles formats:
+        - Step 1: ... / Step 1 - ... / Step1 ...
+        - 1. ..., 2) ... numbered lists
+        - Bullet lists starting with - or *
+        Falls back to paragraph segmentation if no explicit markers.
+        Returns up to max_steps steps.
+        """
+        lines = [l.rstrip() for l in raw_plan.splitlines() if l.strip()]
+        step_candidates: List[str] = []
+        used_line_idx = set()
+        # Patterns (ordered)
+        patterns = [
+            re.compile(r"^\s*Step\s*(\d+)\s*[:\-\.)]?\s*(.+)$", re.IGNORECASE),
+            re.compile(r"^\s*(\d+)\s*[\.)]\s*(.+)$"),
+            re.compile(r"^\s*[-*]\s+(?!Step)(.+)$"),
+        ]
+        for idx, line in enumerate(lines):
+            for pat in patterns:
+                m = pat.match(line)
+                if m:
+                    # Normalise description
+                    if len(m.groups()) == 2:
+                        num, desc = m.group(1), m.group(2)
+                        canonical = f"Step {num}: {desc.strip()}"
+                    else:  # bullet only
+                        desc = m.group(1)
+                        canonical = desc.strip()
+                    if canonical and canonical.lower().startswith('step') and not canonical[4:6].strip():
+                        # extremely short / malformed; skip
+                        continue
+                    step_candidates.append(canonical)
+                    used_line_idx.add(idx)
+                    break
+            if len(step_candidates) >= max_steps:
+                break
+        # Deduplicate preserving order
+        dedup = []
+        seen = set()
+        for s in step_candidates:
+            if s not in seen:
+                seen.add(s)
+                dedup.append(s)
+        step_candidates = dedup
+        # Fallback: if no explicit steps, attempt paragraph segmentation
+        if not step_candidates:
+            paragraphs: List[str] = []
+            buf: List[str] = []
+            for line in raw_plan.splitlines():
+                if line.strip():
+                    buf.append(line.strip())
+                elif buf:
+                    paragraphs.append(" ".join(buf))
+                    buf = []
+            if buf:
+                paragraphs.append(" ".join(buf))
+            # Use first sentences/paragraphs as steps
+            for p in paragraphs:
+                if len(step_candidates) >= max_steps:
+                    break
+                # If paragraph has multiple sentences, take first sentence
+                sentence = re.split(r"(?<=[.!?])\s+", p.strip())[0]
+                if sentence:
+                    step_candidates.append(f"Step {len(step_candidates)+1}: {sentence}")
+        # Final fallback: entire plan as one step
+        if not step_candidates and raw_plan.strip():
+            step_candidates = [f"Step 1: {raw_plan.strip()[:200]}..."]
+        return step_candidates[:max_steps]
         
     def plan(self, query: str, context: List[Dict[str, Any]] = None, context_doc_ids: List[str] = None) -> Dict[str, Any]:
         logger.info(f"\n🎯 Planning step for query: {query}")
@@ -157,12 +229,8 @@ The following legal documents were retrieved from AustLII. These are your only s
         logger.info(f"Plan generated in {time.time() - currtime:.2f} seconds")
         self.log_response(response.content, "Planner")
         raw_plan = response.content
-        # Extract steps heuristically (lines starting with 'Step')
-        steps = []
-        for line in raw_plan.splitlines():
-            l = line.strip()
-            if l.lower().startswith("step"):
-                steps.append(l)
+        # Extract steps with robust parser
+        steps = self._parse_plan_steps(raw_plan)
         # --- New: citation number parsing & mapping ---
         citation_numbers = []
         try:
