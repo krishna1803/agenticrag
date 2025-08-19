@@ -13,6 +13,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from functools import lru_cache
 
+# --- Added for provenance tracking (Step 1) ---
+try:
+    from provenance import ProvenanceStore
+except ImportError:
+    ProvenanceStore = None
+# --- End provenance addition ---
+
 try:
     import yaml
 except ImportError:
@@ -247,6 +254,10 @@ class OCIRAGAgent:
         # Load configuration
         self.config = config or load_config()
         
+        # --- provenance store initialization (Step 1) ---
+        self.provenance = ProvenanceStore() if ProvenanceStore else None
+        # -------------------------------------------------
+        
         # Set similarity search parameters from config
         similarity_config = self.config.get("SIMILARITY_SEARCH", {})
         self.max_results = similarity_config.get("MAX_RESULTS", 3)
@@ -435,12 +446,23 @@ class OCIRAGAgent:
         elif self.collection == "Web Knowledge Base":
             context = self.vector_store.query_web_collection(query)
         
+        # Track provenance for retrieved context (Step 1)
+        if self.provenance and context:
+            for item in context:
+                try:
+                    self.provenance.add_source(item, step="standard")
+                except Exception:
+                    pass
+        
         # Generate response using context if available, otherwise use general knowledge
         if context:
             response = self._generate_response(query, context)
         else:
             response = self._generate_general_response(query)
         
+        # Attach provenance references (Step 1)
+        if self.provenance:
+            response.setdefault("citations", self.provenance.to_reference_list())
         return response
 
     def _generate_response(self, query: str, context: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -500,39 +522,82 @@ Answer the question based on the context provided. If the answer is not in the c
             return self._generate_general_response(query)
         
         try:
-            # Step 1: Planning
-            plan = self.agents["planner"].plan(query, initial_context)
+            # --- Track provenance for initial context and retain ordering for citation mapping ---
+            initial_context_doc_ids: List[str] = []
+            if self.provenance and initial_context:
+                for item in initial_context:
+                    try:
+                        doc_id = self.provenance.add_source(item, step="initial")
+                        initial_context_doc_ids.append(doc_id)
+                    except Exception:
+                        initial_context_doc_ids.append("")
             
-            # Step 2: Research
-            plan_steps = [step for step in plan.split("\n") if step.strip()]
+            # Step 1: Planning (structured output)
+            plan_result = self.agents["planner"].plan(query, initial_context, context_doc_ids=initial_context_doc_ids)
+            plan_steps = plan_result.get("steps", [])
+            logger.info(f"Planner produced {len(plan_steps)} steps")
+            
+            # Step 2: Research for each plan step (structured outputs)
             research_results = []
-            
             for step in plan_steps:
-                findings = self.agents["researcher"].research(query, step)
-                research_results.append({"step": step, "findings": findings})
+                research_dict = self.agents["researcher"].research(
+                    query,
+                    step,
+                    max_chunks=self.max_chunks_per_step,
+                    max_findings=self.max_findings_per_step,
+                    max_tokens=self.max_tokens_per_finding,
+                    max_results=self.max_results,
+                    provenance=self.provenance
+                )
+                research_results.append({"step": step, **research_dict})
             
-            # Step 3: Reasoning
-            reasoning_steps = []
-            for result in research_results:
-                if result.get("findings"):
-                    step_reasoning = self.agents["reasoner"].reason(query, result["step"], result["findings"])
-                    reasoning_steps.append(step_reasoning)
+            # Step 3: Reasoning per research step
+            reasoning_results = []
+            reasoning_texts: List[str] = []
+            for r in research_results:
+                findings = r.get("findings", [])
+                if not findings:
+                    continue
+                reasoning_dict = self.agents["reasoner"].reason(
+                    query,
+                    r["step"],
+                    findings  # list of dicts with 'content' and optional 'citations'
+                )
+                reasoning_results.append({"step": r["step"], **reasoning_dict})
+                reasoning_texts.append(reasoning_dict.get("raw", ""))
             
-            # Step 4: Synthesis
-            if reasoning_steps:
-                final_answer = self.agents["synthesizer"].synthesize(query, reasoning_steps)
+            # Step 4: Synthesis (pass full reasoning dicts for citation mapping)
+            if reasoning_results:
+                synthesis_dict = self.agents["synthesizer"].synthesize(query, reasoning_results)
+                final_answer_text = synthesis_dict.get("answer") or synthesis_dict.get("raw") or ""
             else:
-                final_answer = "I was unable to generate a complete answer based on the available information."
+                synthesis_dict = {"answer": "I was unable to generate a complete answer based on the available information.", "raw": ""}
+                final_answer_text = synthesis_dict["answer"]
             
-            return {
-                "answer": final_answer,
-                "context": initial_context,
-                "reasoning_steps": reasoning_steps
+            response: Dict[str, Any] = {
+                "answer": final_answer_text,
+                "plan": plan_result,
+                "research": research_results,
+                "reasoning_details": reasoning_results,
+                "reasoning_steps": reasoning_texts,
+                "synthesis": synthesis_dict,
+                "context": initial_context
             }
+            # Merge citations from synthesis and prior stages (provenance store already tracks sources)
+            if self.provenance:
+                response["citations"] = self.provenance.to_reference_list()
+            # Include answer-level citation markers for UI
+            if synthesis_dict.get("citation_numbers"):
+                response["answer_citation_markers"] = synthesis_dict["citation_numbers"]
+            return response
             
         except Exception as e:
             logger.error(f"Error in CoT processing: {str(e)}")
-            return self._generate_general_response(query)
+            traceback.print_exc()
+            response = self._generate_general_response(query)
+            if self.provenance:
+                response.setdefault("citations", self.provenance.to_reference_list())
+            return response
 
 
 def load_config() -> Dict[str, Any]:
@@ -669,6 +734,13 @@ def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
         # Process the query
         response = agent.process_query(request["query"])
         
+        # Ensure citations present if provenance enabled (Step 1)
+        if getattr(agent, "provenance", None) and "citations" not in response and agent.provenance:
+            try:
+                response["citations"] = agent.provenance.to_reference_list()
+            except Exception:
+                pass
+        
         # Return the response dictionary
         return response
     except Exception as e:
@@ -778,6 +850,17 @@ def main():
         print("\nResponse:")
         print("-" * 50)
         print(response["answer"])
+        
+        # Print citations if available (Step 1)
+        if response.get("citations"):
+            print("\nCitations:")
+            print("-" * 50)
+            for c in response["citations"]:
+                cid = c.get("id")
+                source = c.get("source")
+                pages = c.get("pages")
+                used = ",".join(c.get("used_in_steps", []))
+                print(f"[{cid}] {source} pages={pages} steps={used}")
         
         if response.get("reasoning_steps"):
             print("\nReasoning Steps:")

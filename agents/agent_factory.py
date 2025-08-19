@@ -6,6 +6,7 @@ import logging
 import warnings
 import time
 from transformers import logging as transformers_logging
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -65,7 +66,7 @@ class PlannerAgent(Agent):
             llm=llm
         )
         
-    def plan(self, query: str, context: List[Dict[str, Any]] = None) -> str:
+    def plan(self, query: str, context: List[Dict[str, Any]] = None, context_doc_ids: List[str] = None) -> Dict[str, Any]:
         logger.info(f"\n🎯 Planning step for query: {query}")
         
         if context:
@@ -155,7 +156,25 @@ The following legal documents were retrieved from AustLII. These are your only s
         response = self.llm.invoke(messages)
         logger.info(f"Plan generated in {time.time() - currtime:.2f} seconds")
         self.log_response(response.content, "Planner")
-        return response.content
+        raw_plan = response.content
+        # Extract steps heuristically (lines starting with 'Step')
+        steps = []
+        for line in raw_plan.splitlines():
+            l = line.strip()
+            if l.lower().startswith("step"):
+                steps.append(l)
+        # --- New: citation number parsing & mapping ---
+        citation_numbers = []
+        try:
+            citation_numbers = list(dict.fromkeys(int(n) for n in re.findall(r'\[(\d+)\]', raw_plan)))
+        except Exception:
+            citation_numbers = []
+        citations = []
+        if context_doc_ids:
+            for n in citation_numbers:
+                if 1 <= n <= len(context_doc_ids):
+                    citations.append(context_doc_ids[n-1])
+        return {"raw": raw_plan, "steps": steps, "citation_numbers": citation_numbers, "citations": citations}
 
 class ResearchAgent(Agent):
     """Agent responsible for gathering and analyzing information"""
@@ -170,7 +189,7 @@ class ResearchAgent(Agent):
             vector_store=vector_store
         )
 
-    def research(self, query: str, step: str, max_chunks: int = 3, max_findings: int = 3, max_tokens: int = 1000, max_results: int = 5) -> List[Dict[str, Any]]:
+    def research(self, query: str, step: str, max_chunks: int = 3, max_findings: int = 3, max_tokens: int = 1000, max_results: int = 5, provenance=None) -> Dict[str, Any]:
         logger.info(f"\n🔍 Researching for step: {step}")
         
         # Query all collections with configurable limits
@@ -180,29 +199,33 @@ class ResearchAgent(Agent):
         # Combine and limit results
         all_results = (pdf_results + repo_results)[:max_chunks]
         logger.info(f"Found {len(all_results)} relevant documents (limited to {max_chunks} from {max_results} max search results)")
-        
+        # --- New: register sources in provenance & keep doc_id ordering for mapping ---
+        context_doc_ids: List[str] = []
+        if provenance and all_results:
+            for item in all_results:
+                try:
+                    doc_id = provenance.add_source(item, step=f"research:{step}")
+                    context_doc_ids.append(doc_id)
+                except Exception:
+                    context_doc_ids.append("")
+        # ...existing code (no_results check)...
         if not all_results:
             logger.warning("No relevant documents found")
-            return []
-        
+            return {"raw": "", "findings": [], "citations": [], "citation_numbers": [], "context_items": [], "doc_ids": []}
         # Create context string with length limit and proper citation format
         context_items = []
         total_chars = 0
         char_limit = max_tokens * 4  # Approximate chars-to-tokens ratio
-        
         for i, item in enumerate(all_results):
             content = item['content']
             if total_chars + len(content) > char_limit:
-                # Truncate this item to fit within limit
                 remaining_chars = char_limit - total_chars
                 if remaining_chars > 100:  # Only add if we can include meaningful content
                     content = content[:remaining_chars] + "..."
                     context_items.append(f"[{i+1}] {content}")
                 break
-            
             context_items.append(f"[{i+1}] {content}")
             total_chars += len(content)
-        
         context_str = "\n\n".join(context_items)
         logger.info(f"Context created with {len(context_items)} items, total chars: {total_chars}")
         
@@ -276,31 +299,38 @@ The following legal documents were retrieved from AustLII. These are your only s
 - Have I used exact citations and titles as provided in the documents?
 
 Key Findings:"""
-    
-        # Use proper parameter name matching the template
         prompt = ChatPromptTemplate.from_template(template)
-        # Fixed: Pass context_str as 'context' to match template
         messages = prompt.format_messages(step=step, context=context_str)
-        
-        # Log what we're sending to the LLM
         prompt_text = "\n".join([msg.content for msg in messages])
         self.log_prompt(prompt_text, "Research")
-        
-        # Time the execution
         start_time = time.time()
         response = self.llm.invoke(messages)
         duration = time.time() - start_time
-        
-        # Log what we got back
         self.log_response(response.content, f"Research ({duration:.2f}s)")
-        
-        # Convert findings to list format
-        findings = [{
-            "content": response.content,
-            "metadata": {"source": "Research Summary"}
-        }]
-        
-        return findings
+        raw_findings = response.content
+        # Heuristic split: split on numbered or dash list items for potential findings
+        findings_list = []
+        for seg in raw_findings.split('\n'):
+            s = seg.strip()
+            if not s:
+                continue
+            if len(findings_list) >= max_findings:
+                break
+            if s[0].isdigit() or s.startswith('-') or s.startswith('*'):
+                findings_list.append(s)
+        if not findings_list:
+            findings_list = [raw_findings]
+        # Parse citation numbers and map to doc_ids
+        try:
+            citation_numbers = list(dict.fromkeys(int(n) for n in re.findall(r'\[(\d+)\]', raw_findings)))
+        except Exception:
+            citation_numbers = []
+        citations: List[str] = []
+        for n in citation_numbers:
+            if 1 <= n <= len(context_doc_ids):
+                citations.append(context_doc_ids[n-1])
+        findings = [{"content": f, "citations": citations, "metadata": {"source": "Research Summary"}} for f in findings_list]
+        return {"raw": raw_findings, "findings": findings, "citation_numbers": citation_numbers, "citations": citations, "context_items": all_results, "doc_ids": context_doc_ids}
 
 class ReasoningAgent(Agent):
     """Agent responsible for logical reasoning and analysis"""
@@ -312,9 +342,14 @@ class ReasoningAgent(Agent):
             llm=llm
         )
         
-    def reason(self, query: str, step: str, context: List[Dict[str, Any]]) -> str:
+    def reason(self, query: str, step: str, context: List[Dict[str, Any]]) -> Dict[str, Any]:
         logger.info(f"\n🤔 Reasoning about step: {step}")
-        
+        # Build mapping of finding index -> doc_ids (citations) from context items
+        index_to_doc_ids: Dict[int, List[str]] = {}
+        for i, item in enumerate(context, start=1):
+            cits = item.get("citations") or []
+            if isinstance(cits, list):
+                index_to_doc_ids[i] = cits
         template = """## AustLII AI Legal Research Assistant - Legal Reasoner
 
 You are a legal research reasoning specialist. Your task is to analyze the provided research findings and draw clear, logical conclusions for this step based ONLY on the retrieved legal documents and references provided below.
@@ -397,14 +432,27 @@ Conclusion:"""
         messages = prompt.format_messages(step=step, query=query, context=context_str)
         prompt_text = "\n".join([msg.content for msg in messages])
         self.log_prompt(prompt_text, "Reasoner")
-
         currtime = time.time()
         logger.info(f"Generating reasoning conclusion using LLM...")
-        # Use the LLM to generate the reasoning conclusion
         response = self.llm.invoke(messages)
         logger.info(f"Reasoning conclusion generated in {time.time() - currtime:.2f} seconds")
         self.log_response(response.content, "Reasoner")
-        return response.content
+        raw_reasoning = response.content
+        # --- New: parse citation markers [#] referring to finding indices ---
+        try:
+            citation_numbers = list(dict.fromkeys(int(n) for n in re.findall(r'\[(\d+)\]', raw_reasoning)))
+        except Exception:
+            citation_numbers = []
+        # Map to underlying provenance doc_ids (union of docs cited in those findings)
+        doc_id_set = []
+        seen = set()
+        for n in citation_numbers:
+            doc_ids = index_to_doc_ids.get(n, [])
+            for d in doc_ids:
+                if d and d not in seen:
+                    seen.add(d)
+                    doc_id_set.append(d)
+        return {"raw": raw_reasoning, "citation_numbers": citation_numbers, "citations": doc_id_set, "marker_to_doc_ids": {n: index_to_doc_ids.get(n, []) for n in citation_numbers}}
 
 class SynthesisAgent(Agent):
     """Agent responsible for combining information and generating final response"""
@@ -416,17 +464,29 @@ class SynthesisAgent(Agent):
             llm=llm
         )
         
-    def synthesize(self, query: str, reasoning_steps: List[str]) -> str:
+    def synthesize(self, query: str, reasoning_steps: List[Any]) -> Dict[str, Any]:
+        # reasoning_steps may be list of strings (backward) or list of dicts with 'raw' & mapping
         logger.info(f"\n📝 Synthesizing final answer from {len(reasoning_steps)} reasoning steps")
-        
-        # Validate reasoning steps before synthesis
-        if not reasoning_steps or not all(isinstance(step, str) and step.strip() for step in reasoning_steps):
-            logger.warning("Invalid reasoning steps detected. Falling back to general response.")
-            return "I don't have enough valid analysis to provide a complete answer."
-        
-        # Create steps_str properly with citation format
-        steps_str = "\n\n".join([f"[Step {i+1}] {step}" for i, step in enumerate(reasoning_steps)])
-        
+        if not reasoning_steps:
+            return {"raw": "", "answer": "I was unable to generate a complete answer based on the available information.", "citations": []}
+        # Normalize to dicts
+        norm_steps = []
+        for s in reasoning_steps:
+            if isinstance(s, dict):
+                norm_steps.append(s)
+            else:
+                norm_steps.append({"raw": str(s)})
+        steps_str = "\n\n".join([f"[Step {i+1}] {d.get('raw','')}" for i, d in enumerate(norm_steps)])
+        # Build aggregate marker->doc_ids mapping from reasoning
+        aggregate_marker_map: Dict[int, List[str]] = {}
+        for d in norm_steps:
+            marker_map = d.get("marker_to_doc_ids") or {}
+            for k, doc_ids in marker_map.items():
+                # merge unique
+                existing = aggregate_marker_map.setdefault(k, [])
+                for doc_id in doc_ids:
+                    if doc_id and doc_id not in existing:
+                        existing.append(doc_id)
         template = """## AustLII AI Legal Research Assistant - Final Synthesizer
 
 You are a legal research synthesis specialist. Your task is to combine the reasoning steps into a coherent, comprehensive final answer based ONLY on the analysis and documents that have been researched.
@@ -503,58 +563,36 @@ Length Limits (based on complexity evident in reasoning steps):
 - Does my answer directly address the original query?
 
 Answer:"""
-    
         try:
-            # Create prompt template
             prompt = ChatPromptTemplate.from_template(template)
-            
-            # Create key-value pairs dictionary for formatting
-            format_dict = {
-                "query": query,
-                "steps": steps_str
-            }
-        
-            # Format the messages using the dictionary
-            messages = prompt.format_messages(**format_dict)
-        
-            # Log what we're sending to the LLM
-            prompt_text = "\n".join([msg.content for msg in messages])
+            messages = prompt.format_messages(query=query, steps=steps_str)
+            prompt_text = "\n".join([m.content for m in messages])
             self.log_prompt(prompt_text, "Synthesizer")
-
-            # Time the execution with robust error handling
             start_time = time.time()
             response = self.llm.invoke(messages)
             duration = time.time() - start_time
-        
-            # Handle different response formats
             if hasattr(response, "content"):
-                result = response.content
-            elif isinstance(response, dict) and "content" in response:
-                result = response["content"]
-            elif isinstance(response, str):
-                result = response
+                result_text = response.content
             else:
-                result = str(response)
-            
-            self.log_response(result, f"Synthesizer ({duration:.2f}s)")
-            return result
-        
+                result_text = str(response)
+            self.log_response(result_text, f"Synthesizer ({duration:.2f}s)")
+            # Parse citation markers in final answer
+            try:
+                answer_markers = list(dict.fromkeys(int(n) for n in re.findall(r'\[(\d+)\]', result_text)))
+            except Exception:
+                answer_markers = []
+            # Map to doc_ids (union of underlying reasoning markers)
+            final_doc_ids = []
+            seen = set()
+            for n in answer_markers:
+                for d in aggregate_marker_map.get(n, []):
+                    if d and d not in seen:
+                        seen.add(d)
+                        final_doc_ids.append(d)
+            return {"raw": result_text, "answer": result_text, "citation_numbers": answer_markers, "citations": final_doc_ids, "marker_to_doc_ids": aggregate_marker_map}
         except Exception as e:
             logger.error(f"Error in synthesis template formatting: {str(e)}")
-        
-            # Try a simpler template as fallback
-            fallback_template = ChatPromptTemplate.from_messages([
-                ("system", "Synthesize the reasoning steps into a final answer based only on the provided analysis."),
-                ("human", f"Query: {query}\n\nAnalysis Steps: {steps_str}\n\nProvide a plain text answer based only on this analysis:")
-            ])
-        
-            try:
-                fallback_messages = fallback_template.format_messages()
-                fallback_response = self.llm.invoke(fallback_messages)
-                return fallback_response.content
-            except Exception as e2:
-                logger.error(f"Even fallback template failed: {str(e2)}")
-                return f"Based on the analysis, {reasoning_steps[0][:200]}..."
+            return {"raw": "", "answer": "I was unable to generate a complete answer due to an internal error.", "citations": []}
 
 def create_agents(llm, vector_store=None):
     """Create and return the set of specialized agents"""
