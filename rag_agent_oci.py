@@ -565,6 +565,15 @@ Answer the question based on the context provided. If the answer is not in the c
                 "research": research_results,
                 "reasoning_details": reasoning_results,
                 "reasoning_steps": reasoning_texts,
+                # New unified reasoning field (list of dicts with step + text + optional citations)
+                "reasoning": [
+                    {
+                        "step": rr.get("step"),
+                        "text": rr.get("raw") or rr.get("reasoning") or rr.get("conclusion") or rr.get("answer") or "",
+                        "citations": rr.get("citations") or rr.get("citation_numbers")
+                    }
+                    for rr in reasoning_results
+                ],
                 "synthesis": synthesis_dict,
                 "context": initial_context
             }
@@ -869,6 +878,12 @@ def main():
         
         response = agent.process_query(args.query)
         
+        # Ensure reasoning field populated if CoT used but missing
+        if use_cot and response.get("reasoning") is None and response.get("reasoning_steps"):
+            response["reasoning"] = [
+                {"step": i+1, "text": txt} for i, txt in enumerate(response.get("reasoning_steps", []))
+            ]
+        
         # In the main function, add this check before printing the answer
         if "The final answer is:" in response.get("answer", ""):
             # Extract only what follows "The final answer is:"
@@ -893,28 +908,33 @@ def main():
         
         # Ensure reasoning steps are shown explicitly when CoT enabled
         if use_cot:
-            steps = response.get("reasoning_steps") or []
+            steps = response.get("reasoning") or response.get("reasoning_steps") or []
             print("\nReasoning Steps:")
             print("-" * 50)
             if steps:
+                # steps could be list of dicts or list of strings
                 for i, step in enumerate(steps):
                     print(f"\nStep {i+1}:")
-                    print(step)
+                    if isinstance(step, dict):
+                        print(step.get("text", ""))
+                    else:
+                        print(step)
             else:
                 print("(none returned)")
-        elif response.get("reasoning_steps"):
-            # Edge: CoT disabled but pipeline returned steps
+        elif response.get("reasoning") or response.get("reasoning_steps"):
             print("\nReasoning Steps (CoT disabled):")
             print("-" * 50)
-            for i, step in enumerate(response["reasoning_steps"]):
+            steps = response.get("reasoning") or response.get("reasoning_steps")
+            for i, step in enumerate(steps):
                 print(f"\nStep {i+1}:")
-                print(step)
+                if isinstance(step, dict):
+                    print(step.get("text", ""))
+                else:
+                    print(step)
         
         if response.get("context"):
             print("\nSources used:")
             print("-" * 50)
-            
-            # Print concise list of sources
             for i, ctx in enumerate(response["context"]):
                 source = ctx["metadata"].get("source", "Unknown")
                 if "page_numbers" in ctx["metadata"]:
@@ -923,7 +943,6 @@ def main():
                 else:
                     file_path = ctx["metadata"].get("file_path", "Unknown")
                     print(f"[{i+1}] {source} (file: {file_path})")
-                
                 if args.verbose:
                     content_preview = ctx["content"][:300] + "..." if len(ctx["content"]) > 300 else ctx["content"]
                     print(f"    Content: {content_preview}\n")
