@@ -733,6 +733,50 @@ def process_request(request: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+def _format_pages(pages_value):
+    """Normalize page number representations to a comma-separated string.
+    Accepts list/tuple/set/str/int/None. Deduplicates & preserves numeric ordering."""
+    if pages_value in (None, ""):
+        return "n/a"
+    # If already a string containing commas or digits only
+    if isinstance(pages_value, str):
+        # Split on non-digit separators, gather ints
+        parts = re.split(r"[^0-9]+", pages_value)
+        nums = [int(p) for p in parts if p.isdigit()]
+    elif isinstance(pages_value, (list, tuple, set)):
+        nums = []
+        for p in pages_value:
+            if p is None: 
+                continue
+            if isinstance(p, int):
+                nums.append(p)
+            elif isinstance(p, str) and p.strip():
+                # Could be range like "3-5"; expand minimally
+                if re.match(r"^\d+$", p.strip()):
+                    nums.append(int(p.strip()))
+                elif re.match(r"^\d+\s*[-:]\s*\d+$", p.strip()):
+                    a, b = re.split(r"[-:]", p.strip())
+                    try:
+                        a_i, b_i = int(a), int(b)
+                        if a_i <= b_i and b_i - a_i <= 50:  # guardrail
+                            nums.extend(range(a_i, b_i + 1))
+                    except Exception:
+                        pass
+            elif isinstance(p, (list, tuple)) and len(p) == 2 and all(isinstance(x, int) for x in p):
+                a_i, b_i = p
+                if a_i <= b_i and b_i - a_i <= 50:
+                    nums.extend(range(a_i, b_i + 1))
+        
+    elif isinstance(pages_value, int):
+        nums = [pages_value]
+    else:
+        return str(pages_value)
+    if not nums:
+        return "n/a"
+    # Deduplicate & sort
+    nums = sorted(set(nums))
+    return ",".join(str(n) for n in nums)
+
 def main():
     import argparse
     import os
@@ -826,7 +870,7 @@ def main():
         response = agent.process_query(args.query)
         
         # In the main function, add this check before printing the answer
-        if "The final answer is:" in response["answer"]:
+        if "The final answer is:" in response.get("answer", ""):
             # Extract only what follows "The final answer is:"
             response["answer"] = re.sub(r'.*The final answer is:\s*', '', response["answer"])
             # Remove any remaining LaTeX formatting
@@ -834,7 +878,7 @@ def main():
         
         print("\nResponse:")
         print("-" * 50)
-        print(response["answer"])
+        print(response.get("answer", "(no answer)"))
         
         # Print citations if available (Step 1)
         if response.get("citations"):
@@ -843,12 +887,24 @@ def main():
             for c in response["citations"]:
                 cid = c.get("id")
                 source = c.get("source")
-                pages = c.get("pages")
+                pages_fmt = _format_pages(c.get("pages"))
                 used = ",".join(c.get("used_in_steps", []))
-                print(f"[{cid}] {source} pages={pages} steps={used}")
+                print(f"[{cid}] {source} pages={pages_fmt} steps={used}")
         
-        if response.get("reasoning_steps"):
+        # Ensure reasoning steps are shown explicitly when CoT enabled
+        if use_cot:
+            steps = response.get("reasoning_steps") or []
             print("\nReasoning Steps:")
+            print("-" * 50)
+            if steps:
+                for i, step in enumerate(steps):
+                    print(f"\nStep {i+1}:")
+                    print(step)
+            else:
+                print("(none returned)")
+        elif response.get("reasoning_steps"):
+            # Edge: CoT disabled but pipeline returned steps
+            print("\nReasoning Steps (CoT disabled):")
             print("-" * 50)
             for i, step in enumerate(response["reasoning_steps"]):
                 print(f"\nStep {i+1}:")
@@ -862,8 +918,8 @@ def main():
             for i, ctx in enumerate(response["context"]):
                 source = ctx["metadata"].get("source", "Unknown")
                 if "page_numbers" in ctx["metadata"]:
-                    pages = ctx["metadata"].get("page_numbers", [])
-                    print(f"[{i+1}] {source} (pages: {pages})")
+                    pages_fmt = _format_pages(ctx["metadata"].get("page_numbers", []))
+                    print(f"[{i+1}] {source} (pages: {pages_fmt})")
                 else:
                     file_path = ctx["metadata"].get("file_path", "Unknown")
                     print(f"[{i+1}] {source} (file: {file_path})")
