@@ -87,6 +87,12 @@ You are a legal research strategic planner. Your task is to break down complex l
 - Do NOT invent content.
 - If you find yourself drawing on legal knowledge beyond the documents, stop and use the fallback response.
 
+**CITATION FORMAT - MANDATORY:**
+- Use ONLY [#] format where # is the document number (e.g., [1], [2], [3])
+- NEVER use [Step #], [Analysis #], or any other format
+- PRESERVE exact [#] citations from any provided analysis
+- Every factual statement MUST have a [#] citation
+
 **If the documents don't provide enough information for planning, respond exactly with:**
 - "I do not have enough information to create a research plan for this query."
 
@@ -131,6 +137,13 @@ The following legal documents were retrieved from AustLII. These are your only s
 - Be concise and precise.
 
 ---
+
+## FINAL CITATION VERIFICATION
+Before submitting your response, verify:
+- Does every factual claim have a [#] citation?
+- Are all [#] references in the correct format (not [Step #] or other variants)?
+- Have I preserved all citations from the analysis exactly as provided?
+- If citations are missing or incorrect, I must revise the response immediately
 
 ## Self-check before final output
 - Have I used ONLY the provided documents?
@@ -214,6 +227,12 @@ You are a legal research information gatherer. Your task is to extract and summa
 - Do NOT invent content.
 - If you find yourself drawing on legal knowledge beyond the documents, stop and use the fallback response.
 
+**CITATION FORMAT - MANDATORY:**
+- Use ONLY [#] format where # is the document number (e.g., [1], [2], [3])
+- NEVER use [Step #], [Analysis #], or any other format
+- PRESERVE exact [#] citations from any provided analysis
+- Every factual statement MUST have a [#] citation
+
 **If the documents don't contain relevant information for this step, respond exactly with:**
 - "I do not have enough information in the provided documents for this research step."
 
@@ -237,6 +256,7 @@ The following legal documents were retrieved from AustLII. These are your only s
 - Identify and quote/paraphrase only relevant sections from the provided documents [#].
 - Focus specifically on information relevant to the research step.
 - Attribute every quote/paraphrase to [#].
+- PRESERVE EXACT [#] citation format throughout
 
 2. **Information extraction**
 - Extract key facts, legal principles, case details, or statutory provisions mentioned in the documents.
@@ -259,6 +279,13 @@ The following legal documents were retrieved from AustLII. These are your only s
 - Do not use interpretive language unless explicitly stated in documents.
 
 ---
+
+## FINAL CITATION VERIFICATION
+Before submitting your response, verify:
+- Does every factual claim have a [#] citation?
+- Are all [#] references in the correct format (not [Step #] or other variants)?
+- Have I preserved all citations exactly as provided?
+- If citations are missing or incorrect, I must revise the response immediately
 
 ## Self-check before final output
 - Have I used ONLY the provided documents?
@@ -320,6 +347,12 @@ You are a legal research reasoning specialist. Your task is to analyze the provi
 - Do NOT invent content.
 - If you find yourself drawing on legal knowledge beyond the documents, stop and use the fallback response.
 
+**CITATION FORMAT - MANDATORY:**
+- Use ONLY [#] format where # is the document number (e.g., [1], [2], [3])
+- NEVER use [Step #], [Analysis #], or any other format
+- PRESERVE exact [#] citations from the research findings
+- Every factual statement MUST have a [#] citation
+
 **If the research findings don't provide enough information for reasoning, respond exactly with:**
 - "I do not have enough information in the research findings to draw a conclusion for this step."
 
@@ -345,6 +378,7 @@ The following findings were extracted from AustLII legal documents. These are yo
 1. **Evidence-based analysis**
 - Analyze only the information explicitly provided in the research findings.
 - Draw conclusions that are directly supported by the findings [#].
+- PRESERVE EXACT [#] citation format throughout
 - Do not extrapolate beyond what is stated in the findings.
 
 2. **Logical reasoning**
@@ -373,6 +407,13 @@ The following findings were extracted from AustLII legal documents. These are yo
 - Focus on answering the specific research step.
 
 ---
+
+## FINAL CITATION VERIFICATION
+Before submitting your response, verify:
+- Does every reasoning point have a [#] citation?
+- Are all [#] references in the correct format (not [Step #] or other variants)?
+- Have I preserved all citations from the findings exactly as provided?
+- If citations are missing or incorrect, I must revise the response immediately
 
 ## Self-check before final output
 - Have I used ONLY the provided research findings?
@@ -417,8 +458,8 @@ class SynthesisAgent(Agent):
             logger.warning("Invalid reasoning steps detected. Falling back to general response.")
             return "I don't have enough valid analysis to provide a complete answer."
         
-        # Create steps_str properly with citation format
-        steps_str = "\n\n".join([f"[Step {i+1}] {step}" for i, step in enumerate(reasoning_steps)])
+        # Create steps_str with preserved citation format (do not change [#] to [Step #])
+        steps_str = "\n\n".join([f"Analysis {i+1}:\n{step}" for i, step in enumerate(reasoning_steps)])
         
         template = """## AustLII AI Legal Research Assistant - Final Synthesizer
 
@@ -431,6 +472,19 @@ You are a legal research synthesis specialist. Your task is to combine the reaso
 - Do not make assumptions, guesses, or inferences beyond the analysis.
 - Do NOT invent content.
 - If you find yourself drawing on legal knowledge beyond the provided analysis, stop and use the fallback response.
+
+**CRITICAL: Citation Preservation**
+- The analysis contains document references in [#] format (e.g., [1], [2], [3])
+- You MUST preserve these exact [#] citations in your final answer
+- Do NOT change [1] to [Step 1] or any other format
+- Every factual claim must maintain its original [#] document reference
+- If you cannot find proper [#] citations, state "insufficient source references"
+
+**CITATION FORMAT - MANDATORY:**
+- Use ONLY [#] format where # is the document number (e.g., [1], [2], [3])
+- NEVER use [Step #], [Analysis #], or any other format
+- PRESERVE exact [#] citations from the reasoning steps
+- Every factual statement MUST have a [#] citation
 
 **If the reasoning steps don't provide enough information for a complete answer, respond exactly with:**
 - "I do not have enough information from the analysis to provide a comprehensive answer to this query."
@@ -468,8 +522,10 @@ The following reasoning steps were derived from AustLII legal documents. These a
 
 4. **Citation maintenance**
 - Preserve all [#] citations exactly as they appear in the reasoning steps.
+- Do NOT change [1] to [Step 1], [Analysis 1], or any other format
 - First mention of a case → use exact case name and citation from reasoning steps
 - First mention of legislation → use exact title and jurisdiction from reasoning steps
+- MAINTAIN EXACT [#] FORMAT THROUGHOUT
 
 5. **Response Requirements**
 Length Limits (based on complexity evident in reasoning steps):
@@ -485,6 +541,15 @@ Length Limits (based on complexity evident in reasoning steps):
 - Use formal legal language and be precise.
 
 ---
+
+## FINAL CITATION VERIFICATION - CRITICAL
+Before submitting your response, verify:
+- Does every factual claim have a [#] citation preserved from the reasoning steps?
+- Are all [#] references in the correct format (not [Step #] or other variants)?
+- Have I preserved all citations from the reasoning steps exactly as provided?
+- Have I avoided changing [1] to [Step 1] or any other format?
+- If any citations are missing or incorrect, I MUST revise the response immediately
+- Does my answer directly address the original query with proper citations?
 
 ## Self-check before final output
 - Have I used ONLY the information from the reasoning steps?
