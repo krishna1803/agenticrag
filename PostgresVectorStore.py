@@ -32,9 +32,12 @@ import json
 
 #from sentence_transformers import SentenceTransformer
 from langchain_ollama import OllamaEmbeddings
+from sentence_transformers import SentenceTransformer
 
 # Use consistent embedding model across the class
-model_name = "sentence-transformers/all-MiniLM-L6-v2"
+#model_name = "sentence-transformers/all-MiniLM-L6-v2"
+model_name = "nomic-ai/nomic-embed-text-v1.5"
+
 # Global embeddings instance - will be replaced by instance-specific one
 embeddings = HuggingFaceEmbeddings(model_name=model_name)
 
