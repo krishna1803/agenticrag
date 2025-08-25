@@ -1,0 +1,90 @@
+# OCI RAG Agent Configuration File
+# This file contains all configurable parameters for the RAG agent
+
+# OCI Configuration
+OCI_COMPARTMENT_ID: "your_compartment_id_here"
+OCI_MODEL_ID: "meta.llama-4-maverick-17b-128e-instruct-fp8"
+
+# Vector Store Configuration
+VECTOR_DB: "postgres"  # Options: "postgres", "oracle"
+COLLECTION: "PDF Collection"  # Options: "PDF Collection", "Repository Collection", "Web Knowledge Base", "General Knowledge"
+
+# Chain of Thought Configuration
+USE_COT: false
+
+# Similarity Search Configuration
+SIMILARITY_SEARCH:
+  # Number of results to retrieve from similarity search (default: 3, configurable: 1-10)
+  MAX_RESULTS: 5
+  # Maximum chunks per research step for CoT (default: 2, configurable: 1-8)
+  MAX_CHUNKS_PER_STEP: 3
+  # Maximum findings per research step for CoT (default: 3, configurable: 1-10)
+  MAX_FINDINGS_PER_STEP: 5
+  # Maximum tokens per finding (default: 1000, configurable: 500-3000)
+  MAX_TOKENS_PER_FINDING: 1500
+  # Enable predicate-based filtering for enhanced search precision
+  ENABLE_PREDICATE_FILTERING: true
+
+# Performance Optimization Configuration
+PERFORMANCE:
+  # LLM Batch Processing
+  BATCH_PROCESSING:
+    # Enable batch processing for improved performance
+    ENABLED: true
+    # Maximum concurrent requests in batch processing (default: 3, configurable: 1-5)
+    MAX_CONCURRENT: 3
+    # Timeout for individual requests in seconds (default: 60, configurable: 30-120)
+    REQUEST_TIMEOUT: 60
+    # Timeout for batch completion in seconds (default: 120, configurable: 60-300)
+    BATCH_TIMEOUT: 120
+  
+  # Caching Configuration
+  CACHING:
+    # Enable LLM and agent caching
+    ENABLED: true
+    # Maximum cache size for LLMs (default: 10, configurable: 5-20)
+    LLM_CACHE_SIZE: 10
+    # Maximum cache size for agents (default: 10, configurable: 5-20)
+    AGENT_CACHE_SIZE: 10
+    # Cache warming on startup
+    WARM_CACHE_ON_STARTUP: true
+  
+  # Parallel Processing Configuration
+  PARALLEL_PROCESSING:
+    # Enable parallel research processing
+    ENABLED: true
+    # Maximum parallel workers for research steps (default: 3, configurable: 1-5)
+    MAX_WORKERS: 3
+    # Use improved parallel processing (ThreadPoolExecutor vs asyncio)
+    USE_THREAD_POOL: true
+  
+  # Context Management
+  CONTEXT:
+    # Maximum tokens for context (default: 12000, configurable: 8000-20000)
+    MAX_TOKENS: 12000
+    # Character to token ratio for estimation (default: 4, configurable: 3-5)
+    CHAR_TO_TOKEN_RATIO: 4
+    # Limit context automatically based on token budget
+    AUTO_LIMIT_CONTEXT: true
+
+# Response Quality Configuration
+RESPONSE_QUALITY:
+  # Enable LaTeX formatting removal
+  REMOVE_LATEX_FORMATTING: true
+  # Enable response validation and error handling
+  ENABLE_VALIDATION: true
+  # Maximum plan steps for CoT (default: 3, configurable: 2-5)
+  MAX_PLAN_STEPS: 3
+  # Fallback to general response on errors
+  FALLBACK_ON_ERROR: true
+
+# Logging Configuration
+LOGGING:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  LEVEL: "INFO"
+  # Enable detailed prompt logging
+  LOG_PROMPTS: true
+  # Enable performance timing logs
+  LOG_PERFORMANCE: true
+  # Enable cache statistics logging
+  LOG_CACHE_STATS: true

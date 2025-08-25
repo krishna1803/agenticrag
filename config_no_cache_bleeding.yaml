@@ -1,0 +1,65 @@
+# Configuration file to prevent context bleeding in cached agents
+# Use this configuration if you're experiencing inaccurate responses due to 
+# previous context being maintained between queries
+
+# Recommended configuration for maximum isolation
+OCI_COMPARTMENT_ID: "your_compartment_id_here"
+OCI_MODEL_ID: "meta.llama-4-maverick-17b-128e-instruct-fp8"
+VECTOR_DB: "postgres"
+COLLECTION: "PDF Collection"
+USE_COT: false
+
+SIMILARITY_SEARCH:
+  MAX_RESULTS: 3
+  MAX_CHUNKS_PER_STEP: 2
+  MAX_FINDINGS_PER_STEP: 3
+  MAX_TOKENS_PER_FINDING: 1000
+
+PERFORMANCE:
+  BATCH_PROCESSING:
+    ENABLED: true
+    MAX_CONCURRENT: 3
+    REQUEST_TIMEOUT: 60
+    BATCH_TIMEOUT: 120
+  
+  # CACHE CONFIGURATION - KEY SETTINGS TO PREVENT CONTEXT BLEEDING
+  CACHING:
+    ENABLED: true                    # Master cache switch
+    LLM_CACHING_ENABLED: false      # 🔴 DISABLE to prevent LLM context retention
+    AGENT_CACHING_ENABLED: false    # 🔴 DISABLE to prevent agent state sharing
+    LLM_CACHE_SIZE: 10
+    AGENT_CACHE_SIZE: 10
+    WARM_CACHE_ON_STARTUP: false    # 🔴 DISABLE for fresh start
+  
+  PARALLEL_PROCESSING:
+    ENABLED: true
+    MAX_WORKERS: 3
+    USE_THREAD_POOL: true
+  
+  CONTEXT:
+    MAX_TOKENS: 12000
+    CHAR_TO_TOKEN_RATIO: 4
+    AUTO_LIMIT_CONTEXT: true
+
+RESPONSE_QUALITY:
+  REMOVE_LATEX_FORMATTING: true
+  ENABLE_VALIDATION: true
+  MAX_PLAN_STEPS: 10
+  FALLBACK_ON_ERROR: true
+
+LOGGING:
+  LEVEL: "INFO"
+  LOG_PROMPTS: true
+  LOG_PERFORMANCE: true
+  LOG_CACHE_STATS: true
+
+# Alternative: Balanced performance configuration
+# Use this if you want some caching benefits but reduced bleeding risk
+#
+# CACHING:
+#   ENABLED: true
+#   LLM_CACHING_ENABLED: true       # Keep LLM caching for performance
+#   AGENT_CACHING_ENABLED: false    # Disable agent caching to prevent state sharing
+#   LLM_CACHE_SIZE: 10
+#   AGENT_CACHE_SIZE: 10
+#   WARM_CACHE_ON_STARTUP: true

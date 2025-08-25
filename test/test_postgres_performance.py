@@ -6,6 +6,12 @@ This script helps identify performance bottlenecks in the similarity search
 
 import time
 import logging
+import sys
+import os
+
+# Add the parent directory (project root) to Python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from PostgresVectorStore import PostgresVectorStore
 
 # Configure logging

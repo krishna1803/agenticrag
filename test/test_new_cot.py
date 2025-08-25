@@ -1,6 +1,8 @@
 import sys
 import os
 import argparse
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel

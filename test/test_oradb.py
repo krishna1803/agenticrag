@@ -1,10 +1,15 @@
 import argparse
 import json
-from OraDBVectorStore import OraDBVectorStore
-import time
 import sys
+import os
 import yaml
 from pathlib import Path
+
+# Add the parent directory (project root) to Python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from OraDBVectorStore import OraDBVectorStore
+import time
 
 def check_credentials():
     """Check if Oracle DB credentials are configured in config.yaml"""

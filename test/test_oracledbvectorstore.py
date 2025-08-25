@@ -1,10 +1,15 @@
 import argparse
 import json
-from OracleDBVectorStore import OracleDBVectorStore
-import time
 import sys
+import os
 import yaml
 from pathlib import Path
+
+# Add the parent directory (project root) to Python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from OracleDBVectorStore import OracleDBVectorStore
+import time
 
 
 def check_credentials():
