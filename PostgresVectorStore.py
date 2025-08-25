@@ -37,9 +37,10 @@ from sentence_transformers import SentenceTransformer
 # Use consistent embedding model across the class
 #model_name = "sentence-transformers/all-MiniLM-L6-v2"
 model_name = "nomic-ai/nomic-embed-text-v1.5"
+model_kwargs = {"trust_remote_code": True}
 
 # Global embeddings instance - will be replaced by instance-specific one
-embeddings = HuggingFaceEmbeddings(model_name=model_name)
+embeddings = HuggingFaceEmbeddings(model_name=model_name, model_kwargs=model_kwargs)
 
 
 
@@ -70,7 +71,7 @@ class PostgresVectorStore(VectorStore):
 
         self.collection_name = collection_name
         # Use consistent embedding model - same as the one used for storing embeddings
-        self._embedding_function = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        self._embedding_function = HuggingFaceEmbeddings(model_name="nomic-ai/nomic-embed-text-v1.5", model_kwargs={"trust_remote_code": True})
         self.override_relevance_score_fn = relevance_score_fn
         
         # Load Postgres DB credentials from config_pg.yaml
